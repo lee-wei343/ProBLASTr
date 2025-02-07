@@ -40,7 +40,7 @@ for query in $QUERY_DIR/*\.fasta; do
         tblastn \
             -query "$query" \
             -db "$OUTPUT_DIR/$db_name" \
-            -out "$OUTPUT_DIR/${query_name}_in_${db_name}.tbv" \
+            -out "$OUTPUT_DIR/${query_name}_in_${db_name}.tsv" \
             -evalue 1e-5 \
             -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore"
     done
