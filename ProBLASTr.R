@@ -8,12 +8,12 @@ library(stringi)
 
 
 ##
-#  options(error = NULL)
+ options(error = NULL)
 # 
-options(error = function(){
-  beepr::beep(9)
-  Sys.sleep(2)
-})
+# options(error = function(){
+#   beepr::beep(9)
+#   Sys.sleep(2)
+# })
 
 ##
 
@@ -102,13 +102,11 @@ create_blastdb_and_run_tblastn <- function(genome_dir, query_dir, output_dir,
                        "-db", db,
                        "-out", output_file,
                        "-evalue", evalue,
-                       "-outfmt", "\"6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore\""))
+                       "-outfmt", "\"6 qseqid sseqid percent_identity length mismatch gapopen qstart qend sstart send evalue bitscore\""))
       
       # ensure no empty files are left behind if the evalue threshhold filters out all hits
-      if (file.exists(output_file)) {
-        if (file.size(output_file) == 0) {
-          file.remove(output_file)
-        }
+      if (file.exists(output_file) && file.size(output_file) == 0) {
+        file.remove(output_file)
       } 
     }
   }
@@ -288,15 +286,251 @@ gene_seq_to_prot <- function(genome_file, gff_file, transcript_id, output_dir,
              file.path(transcript_output_dir_path,
                        paste0(gene_name, "_transcript.fasta")))
   
+  return(protein_output_dir_path)
+}
+ 
+ 
+ 
+ 
+
+# confirm homology --------------------------------------------------------
+
+verify_tomato_potato_homology <- function(output_dir, 
+                                         tomato_proteom = "tomato/UP000004994_4081.fasta",
+                                         potato_prot,
+                                         tomato_prot,
+                                         evalue = 1e-5) {
+  
+  
+  # Input validation
+  if (!file.exists(tomato_proteom)) {
+   stop("Tomato proteome file not found: ", tomato_proteom)
+  }
+  if (!dir.exists(potato_prot)) {
+   stop("Potato protein directory not found: ", potato_prot)
+  }
+  if (!dir.exists(tomato_prot)) {
+   stop("Tomato protein directory not found: ", tomato_prot)
+  }
+  
+  # Create output directories
+  homologue_verifi_path <- file.path(output_dir, "homologue_verification")
+  tomato_proteom_db_path <- file.path(homologue_verifi_path, "blastp_database")
+  
+  for (dir in c(homologue_verifi_path, tomato_proteom_db_path)) {
+   if (!dir.exists(dir)) {
+     dir.create(dir, recursive = TRUE)
+   }
+  }
+  
+  # Create BLAST database
+  message("Creating BLAST database from tomato proteome...")
+  proteom_db_path <- file.path(tomato_proteom_db_path,
+                              paste0(tools::file_path_sans_ext(basename(tomato_proteom)),
+                                     "_db"))
+  system2("makeblastdb",
+         args = c("-in", tomato_proteom,
+                  "-dbtype", "prot",
+                  "-out", proteom_db_path))
+  
+  # Helper function for BLAST with improved error handling
+  blastp <- function(query, db, out, evalue = 1e-5) {
+   message("Running BLAST for query: ", basename(query))
+   tryCatch({
+     cmd_result <- system2("blastp",
+                           args = c("-query", query,
+                                    "-db", db,
+                                    "-out", out,
+                                    "-evalue", evalue,
+                                    "-outfmt", "\"6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore\""), # pident is percentage identity of the sequences
+                           stderr = TRUE)
+     
+     # Print command output for debugging
+     if (!is.null(cmd_result) && length(cmd_result) > 0) {
+       message("BLAST output: ", paste(cmd_result, collapse="\n"))
+     }
+     
+     # Check if file exists and has content
+     if (file.exists(out)) {
+       if (file.size(out) == 0) {
+         message("No BLAST hits found for: ", basename(query))
+         file.remove(out)
+         return(FALSE)
+       }
+       
+       # Read first line to check structure
+       first_line <- readLines(out, n = 1)
+       cols <- strsplit(first_line, "\t")[[1]]
+       message("Number of columns in output: ", length(cols))
+       message("First line: ", first_line)
+       
+       return(TRUE)
+     } else {
+       message("Output file not created for: ", basename(query))
+       return(FALSE)
+     }
+   }, error = function(e) {
+     warning("BLAST failed for query: ", query, "\nError: ", e$message)
+     return(FALSE)
+   })
+  }
+  
+  # Process potato proteins
+  message("\nProcessing potato proteins...")
+  potato_prot_blast_hit_path <- file.path(homologue_verifi_path, "potato_prot_blast_hit")
+  dir.create(potato_prot_blast_hit_path, showWarnings = FALSE)
+  
+  potato_results <- data.frame()
+  potato_files <- list.files(potato_prot, pattern = "_protein.fasta$", full.names = TRUE)
+  
+  for (protein_seq in potato_files) {
+   output_file <- file.path(potato_prot_blast_hit_path, 
+                            paste0(basename(tools::file_path_sans_ext(protein_seq)), 
+                                   "_in_", 
+                                   basename(tools::file_path_sans_ext(tomato_proteom)),
+                                   ".tsv"))
+   
+   if (blastp(query = protein_seq, 
+              db = proteom_db_path, 
+              out = output_file,
+              evalue = evalue)) {
+     
+     message("Reading BLAST results from: ", basename(output_file))
+     
+     # Safely read the BLAST results
+     tryCatch({
+       blast_results <- read.table(output_file, 
+                                   sep = "\t",
+                                   col.names = c("qseqid", "sseqid", "pident", "length", 
+                                                 "mismatch", "gapopen", "qstart", "qend", 
+                                                 "sstart", "send", "evalue", "bitscore"))
+       blast_results$source_file <- basename(protein_seq)
+       potato_results <- rbind(potato_results, blast_results)
+     }, error = function(e) {
+       warning("Error reading BLAST results from ", output_file, ": ", e$message)
+     })
+   }
+  }
+  
+  # Process tomato proteins
+  message("\nProcessing original tomato proteins...")
+  tomato_prot_blast_hit_path <- file.path(homologue_verifi_path, "tomato_prot_blast_hit")
+  dir.create(tomato_prot_blast_hit_path, showWarnings = FALSE)
+  
+  tomato_results <- data.frame()
+  tomato_files <- list.files(tomato_prot, pattern = "\\.fasta$", full.names = TRUE)
+  
+  for (protein_seq in tomato_files) {
+   output_file <- file.path(tomato_prot_blast_hit_path, 
+                            paste0(basename(tools::file_path_sans_ext(protein_seq)), 
+                                   "_in_", 
+                                   basename(tools::file_path_sans_ext(tomato_proteom)),
+                                   ".tsv"))
+   
+   if (blastp(query = protein_seq, 
+              db = proteom_db_path, 
+              out = output_file,
+              evalue = evalue)) {
+     
+     message("Reading BLAST results from: ", basename(output_file))
+     
+     # Safely read the BLAST results
+     tryCatch({
+       blast_results <- read.table(output_file, 
+                                   sep = "\t",
+                                   col.names = c("qseqid", "sseqid", "pident", "length", 
+                                                 "mismatch", "gapopen", "qstart", "qend", 
+                                                 "sstart", "send", "evalue", "bitscore"))
+       blast_results$source_file <- basename(protein_seq)
+       tomato_results <- rbind(tomato_results, blast_results)
+     }, error = function(e) {
+       warning("Error reading BLAST results from ", output_file, ": ", e$message)
+     })
+   }
+  }
+  
+  # Compare results and generate summary
+  message("\nGenerating comparison summary...")
+  
+  if (nrow(potato_results) > 0 && nrow(tomato_results) > 0) {
+   # Get best hits for each query
+   potato_best_hits <- potato_results |>
+     group_by(source_file) |>
+     slice_max(order_by = bitscore, n = 1)
+   
+   tomato_best_hits <- tomato_results |>
+     group_by(source_file) |>
+     slice_max(order_by = bitscore, n = 1)
+   
+   # Compare hits
+   comparison <- potato_best_hits |>
+     left_join(
+       tomato_best_hits,
+       by = "sseqid",
+       suffix = c("_potato", "_tomato")
+     ) |>
+     mutate(
+       match_quality = case_when(
+         is.na(bitscore_tomato) ~ "No Match",
+         pident_potato >= 90 & pident_potato/pident_tomato >= 0.9 ~ "Strong Homolog",
+         pident_potato >= 70 & pident_potato/pident_tomato >= 0.7 ~ "Moderate Homolog",
+         pident_potato >= 50 & pident_potato/pident_tomato >= 0.5 ~ "Weak Homolog",
+         TRUE ~ "Poor Match"
+       ),
+       similarity_ratio = pident_potato/pident_tomato,
+       coverage_ratio = length_potato/length_tomato
+     )
+   
+   # Generate summary statistics
+   summary_stats <- comparison |>
+     group_by(match_quality) |>
+     summarise(
+       count = n(),
+       avg_similarity = mean(similarity_ratio, na.rm = TRUE),
+       avg_coverage = mean(coverage_ratio, na.rm = TRUE),
+       .groups = "drop"
+     )
+   
+   # Write results
+   write_csv(comparison, 
+             file.path(homologue_verifi_path, "homology_comparison_detailed.csv"))
+   write_csv(summary_stats, 
+             file.path(homologue_verifi_path, "homology_summary_stats.csv"))
+   
+   # Return results
+   return(list(
+     detailed_comparison = comparison,
+     summary_statistics = summary_stats
+   ))
+  } else {
+   warning("No BLAST results found for comparison")
+   return(NULL)
+  }
 }
 
+# results <- verify_tomato_potato_homology(
+#   output_dir = "out_2024_02_16", 
+#   tomato_proteom = "tomato/UP000004994_4081.fasta",
+#   potato_prot = "out_2024_02_16/protein",
+#   tomato_prot = "meiotic_genes_protein_fasta",
+#   evalue = 1e-5
+# )
+ 
+ 
+ 
 # main --------------------------------------------------------------------
 main <- function(genome_dir, 
                  query_dir, 
                  gff_dir, 
                  output_dir, 
                  evalue = 1e-5, 
-                 min_seq_len = 50000) {
+                 min_seq_len = 50000,
+                 tomato_proteom = "tomato/UP000004994_4081.fasta") {
+  # check if parameters are provided
+  if (missing(genome_dir) || missing(query_dir) || missing(gff_dir) || missing(output_dir) || missing(tomato_proteom)) {
+    stop("Required parameter missing!")
+  }
+  
   
   # read in an index file which should contain gff_file_path with matching genome_file_path
   if (!(file.exists("index.csv"))) {
@@ -348,7 +582,7 @@ main <- function(genome_dir,
     blast_hit_table <- read.table(
       file = blast_hit_file_path,
       sep = "\t",
-      col.names = c("qseqid", "sseqid", "pident", "length", "mismatch", "gapopen",
+      col.names = c("qseqid", "sseqid", "percent_identity", "length", "mismatch", "gapopen",
                     "qstart", "qend", "sstart", "send", "evalue", "bitscore")
     ) |>
       mutate(sseqid = as.character(sseqid)) # make sure that ssequid of both df will be of same type
@@ -421,6 +655,9 @@ main <- function(genome_dir,
   
     # Translate and transcripe the annotated blast hits to protein sequences
     # gene_hit are the best blast results with the gene name from the gff file
+    
+    protein_output_dir_path <- file.path(output_dir, "protein")
+    
     for (i in seq_along(index_de$gene_hit_path)) {
       cat("Iteration: ", i)
       gene_hit_path <- index_de$gene_hit_path[i]
@@ -465,24 +702,21 @@ main <- function(genome_dir,
     }
   # save index
   write_csv(index_de, file = "final_index.csv")
+  
+  tryCatch({
+    # verify if the protein sequences are homolog to each other based of the tomato proteom
+    results <- verify_tomato_potato_homology(
+      output_dir = output_dir, 
+      tomato_proteom = tomato_proteom,
+      potato_prot =  protein_output_dir_path,
+      tomato_prot = query_dir,
+      evalue = 1e-5
+    )}, error = function(e) {
+    warning("Error in function verify_tomato_potato_homology: ", e$message, "\n")
+  }
+  )
+  
 }
-
-#####
-
-# tomato_blast <- function(genome_dir, gen_file_pattern, query_dir, tomato_out_dir) {
-#   if (!(dir.exists(tomato_out_dir))) {
-#     dir.create(tomato_out_dir)
-#   }
-#   
-#   for (proteine_file in query_dir) {
-#     # look if resulting protein sequences can be found in the tomato genome
-#     create_blastdb_and_run_tblastn(genome_dir = genome_dir,
-#                                    query_dir = query_dir,
-#                                    output_dir = tomato_out_dir)
-#   }
-# }
-
-
 
 # calls ---------------------------------------------------------------
 main(genome_dir = "genomes",
@@ -491,32 +725,3 @@ main(genome_dir = "genomes",
      output_dir = "out_2024_02_16",
      evalue = 1e-5)
 
-
-
-
-# system2("makeblastdb",
-#         args = c("-in", "tomato/UP000004994_4081.fasta", 
-#                  "-dbtype", "prot",
-#                  "-out", "tco_out/tomato_blast_hit/tomato_db"))
-
-###
-# for (protein_fasta in list.files(path = "tco_out/protein", full.names = T)) {
-#   tomato_output_file_name <- paste0("tco_out/tomato_blast_hit_", basename(protein_fasta), ".tsv")
-#   # Run Bash blastp! protein sequence to proteom
-#   system2("blastp",
-#           args = c("-query", protein_fasta,
-#                    "-db", "tco_out/tomato_blast_hit/tomato_db",
-#                    "-out", tomato_output_file_name,
-#                    "-evalue", 1e-5,
-#                    "-outfmt", "\"6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore\""))
-# }
-# 
-# 
-# # Run Bash blast**p**! protein sequence to proteom
-# system2("blastp",
-#         args = c("-query", "tco_out/protein/Soltub.DH_A07.04_2G002120.1_protein.fasta",
-#                  "-db", "tco_out/tomato_blast_hit/tomato_db",
-#                  "-out", "tco_out/tomato_hit.tsv",
-#                  "-evalue", 1e-5,
-#                  "-outfmt", "\"6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore\""))
-# 
