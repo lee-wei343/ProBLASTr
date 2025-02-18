@@ -649,8 +649,8 @@ verify_tomato_potato_homology <- function(output_dir,
 
 #' Main execution function for ProBLASTr pipeline
 #'
-#' This function orchestrates the entire ProBLASTr workflow, from initial BLAST
-#' searches through gene finding and homology verification.
+#' This function runs the entire ProBLASTr workflow, from initial BLAST searches 
+#' through gene finding, protein sequence translation and homology verification.
 #'
 #' @param genome_dir Directory containing genome files
 #' @param query_dir Directory containing query files
