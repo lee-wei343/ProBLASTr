@@ -21,14 +21,15 @@
 # [Your Email]
 # Univeristy of Cologne
 #
-# Version: 0.8
-# Last Updated: [2025.02.18]
+# Version: 0.9
+# Last Updated: [2025.02.21]
 #
-# This script is part of [Project Name]
 # Project Repository: [URL to your repository]
-# Documentation: [URL to documentation if available]
 #
 # Dependencies:
+# blastn: 2.16.0+
+#   Package: blast 2.16.0, build Aug  7 2024 01:45:09
+#
 # R version 4.4.1 (2024-06-14)
 # Platform: x86_64-pc-linux-gnu
 # Running under: Ubuntu 24.10
@@ -78,7 +79,8 @@
 #
 # Notes:
 # Any additional information that users should know about this script
-# --------------------------------------------------------------------------
+# ProBLASTr functions -----------------------------------------------------
+
 
 # Load required libraries
 library(tidyverse)
@@ -89,8 +91,16 @@ library(rtracklayer)
 library(Rsamtools)
 library(stringi)
 
-# Error handling configuration
-options(error = NULL)
+# error_log <- function() {
+#   cat(format(Sys.time()),
+#       geterrmessage(),
+#       "\n",
+#       file = "error_log.txt",
+#       append = T)
+# }
+# 
+# # Error handling configuration
+# options(error = error_log)
 
 #' Create BLAST database and run tBLASTn search
 #'
@@ -106,7 +116,7 @@ options(error = NULL)
 #' @param qur_file_pattern Pattern to match query files
 #' @return DataFrame containing paths to query and BLAST hit files
 create_blastdb_and_run_tblastn <- function(genome_dir,
-                                           query_dir,
+                                           query_dir, 
                                            output_dir,
                                            evalue = 1e-5,
                                            dbtype = "nucl",
@@ -120,10 +130,13 @@ create_blastdb_and_run_tblastn <- function(genome_dir,
     stop(paste0("Query directory '", query_dir, "' not found!"))
   }
   
-  # Create directories for BLAST database
+  # Create directories
   blast_database_dir <- file.path(output_dir, "blast_database")
-  if (!dir.exists(blast_database_dir)) {
-    dir.create(blast_database_dir, recursive = TRUE)
+  blast_hits_dir <- file.path(output_dir, "blast_hits")
+  for (dir in c(blast_database_dir, blast_hits_dir)) {
+    if (!dir.exists(dir)) {
+      dir.create(dir, recursive = TRUE)
+    }
   }
   
   # List and validate genome files
@@ -149,10 +162,10 @@ create_blastdb_and_run_tblastn <- function(genome_dir,
         "-dbtype",
         dbtype,
         "-out",
-        db_name,
-        "-parse_seqids"
+        db_name #,"-parse_seqids" error header longer than 50
       )
     )
+    # keep track of the database paths
     db_paths[i] <- db_name
   }
   
@@ -164,27 +177,23 @@ create_blastdb_and_run_tblastn <- function(genome_dir,
   
   message("Running BLAST searches...")
   
-  # Create directory for BLAST hits
-  blast_hits_dir <- file.path(output_dir, "blast_hits")
-  if (!dir.exists(blast_hits_dir)) {
-    dir.create(blast_hits_dir, recursive = TRUE)
-  }
-  
-  # Initialize index for tracking BLAST queries and results
-  index_blast <- data.frame(query_path = character(0),
-                            blast_hit_file_path = character(0))
+  # Initialize index for successful BLAST runs
+  index_blast <- data.frame(
+    query_path = character(0),
+    blast_hit_file_path = character(0)
+  )
   
   # Run BLAST for each query against each database
   for (query in query_files) {
     query_name <- tools::file_path_sans_ext(basename(query))
-    for (db in unlist(db_paths)) {
-      cat(paste0("Query: '", query, "'\n", "Db: '", db, "'\n"))
+    for (db in db_paths) {
+      message(sprintf("Query: '%s'\nDb: '%s'\n", query, db))
       
       db_name <- basename(db)
       output_file <- file.path(blast_hits_dir,
                                paste0(query_name, "_in_", db_name, ".tsv"))
       
-      # Run tBLASTn
+      # Run tBLASTn with properly escaped quotes
       system2(
         "tblastn",
         args = c(
@@ -197,11 +206,11 @@ create_blastdb_and_run_tblastn <- function(genome_dir,
           "-evalue",
           evalue,
           "-outfmt",
-          "\"6 qseqid sseqid percent_identity length mismatch gapopen qstart qend sstart send evalue bitscore\""
+          "\"6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore\""
         )
       )
       
-      # Handle empty results
+      # Handle empty files
       if (file.exists(output_file) && file.size(output_file) == 0) {
         file.remove(output_file)
       }
@@ -218,51 +227,135 @@ create_blastdb_and_run_tblastn <- function(genome_dir,
       }
     }
   }
+  
   return(index_blast)
+}
+
+#' Filter genes from BLAST hits
+filter_gene_hits <- function(blast_hits, max_distance = 10000, 
+                             min_bitscore = 30) {
+  if (nrow(blast_hits) == 0) return(blast_hits)
+  
+  # First, filter by minimum bit score
+  quality_hits <- blast_hits |>
+    filter(bitscore >= min_bitscore)
+  
+  if (nrow(quality_hits) == 0) return(quality_hits)
+  
+  # Group hits by chromosome
+  hits_by_chrom <- split(quality_hits, quality_hits$sseqid)
+  
+  result <- data.frame()
+  
+  for (chrom in names(hits_by_chrom)) {
+    chrom_hits <- hits_by_chrom[[chrom]]
+    
+    # Sort by position
+    chrom_hits <- chrom_hits |>
+      mutate(
+        hit_start = pmin(sstart, send),
+        hit_end = pmax(sstart, send)
+      ) |>
+      arrange(hit_start)
+    
+    # If there's only one hit for this chromosome, keep it and continue
+    if (nrow(chrom_hits) == 1) {
+      result <- rbind(result, chrom_hits)
+      next
+    }
+    
+    # Check if hits are close enough to be from the same gene
+    is_same_gene <- TRUE
+    for (i in 2:nrow(chrom_hits)) {
+      # Check for NA values before comparison
+      if (is.na(chrom_hits$hit_start[i]) || is.na(chrom_hits$hit_end[i-1])) {
+        is_same_gene <- FALSE
+        break
+      }
+      
+      if (chrom_hits$hit_start[i] - chrom_hits$hit_end[i-1] > max_distance) {
+        is_same_gene <- FALSE
+        break
+      }
+    }
+    
+    # If they appear to be from the same gene, retain all hits
+    # Otherwise, keep only the best hit
+    if (is_same_gene) {
+      result <- rbind(result, chrom_hits)
+    } else {
+      best_hit <- chrom_hits |>
+        slice_max(order_by = bitscore, n = 1)
+      result <- rbind(result, best_hit)
+    }
+  }
+  
+  return(result)
 }
 
 
 #' Find genes from BLAST hits
 #'
-#' This function identifies genes in the genomic regions corresponding to BLAST hits
+#' This function identifies genes corresponding to BLAST hits
 #' 
 #' @param blast_hit DataFrame containing a BLAST hit with the column sseqid
 #' @param gff_file Directory containing Gene Annotation gff files ending with ".gff3"
-#' @param min_seq_len Minimus Sequence length for a Sequence in a BLAST hit
+#' @param min_seq_len Minimum sequence length between sequences
 #' @return DataFrame containing BLAST hit and Gene names from the corresponfing gff_file if it has at least one row otherwise NULL
 find_gene_from_blast_hit <- function(blast_hit, gff_file, min_seq_len) {
-  # Filter BLAST hits based on overlap and quality criteria
-  filtered_blast_hit <- blast_hit |>
+  
+  # First, apply our filtering function
+  filtered_blast_hits <- filter_gene_hits(blast_hit, max_distance = min_seq_len, min_bitscore = 30)
+  
+  # Now proceed with coordinate-based matching as before
+  filtered_blast_hit <- filtered_blast_hits |>
     mutate(low_start = pmin(sstart, send),
            high_end = pmax(sstart, send)) |>
     group_by(sseqid) |>
-    arrange(low_start) |>
-    mutate(
-      prev_end = lag(high_end, default = head(high_end, 1)),
-      distance_to_prev = low_start - prev_end,
-      is_overlap = low_start <= prev_end
-    ) |>
-    filter((distance_to_prev <= min_seq_len |
-              is.na(distance_to_prev)) &
-             !is_overlap) |>
-    filter(bitscore >= 50) |>
     ungroup() |>
-    select(-prev_end,-distance_to_prev,-is_overlap,
-           low_start,
-           high_end)
+    dplyr::select(-contains("idk"),
+                  low_start,
+                  high_end)
   
-  # Match BLAST hits with gene annotations
-  result <- inner_join(filtered_blast_hit,
+  # Find the gene(s) that encompass all these hits
+  hit_ranges <- filtered_blast_hit |>
+    group_by(sseqid) |>
+    summarize(
+      min_pos = min(low_start),
+      max_pos = max(high_end)
+    )
+  
+  # Match with gene annotations
+  result <- inner_join(hit_ranges,
                        gff_file,
                        by = "sseqid",
                        relationship = "many-to-many") |>
-    select(-contains("idk")) |>
-    mutate(seq_in_gene = ifelse(sstart >= gstart &
-                                  send <= gend, TRUE, FALSE)) |>
-    filter(seq_in_gene == TRUE) |>
-    select(-seq_in_gene)
+    filter(
+      # Gene must overlap with our hit range
+      !(min_pos > gend | max_pos < gstart)
+    ) |>
+    # Calculate what percentage of our hits the gene covers
+    mutate(
+      overlap_start = pmax(min_pos, gstart),
+      overlap_end = pmin(max_pos, gend),
+      overlap_length = overlap_end - overlap_start,
+      hit_length = max_pos - min_pos,
+      overlap_fraction = overlap_length / hit_length
+    ) |>
+    filter(overlap_fraction >= 0.5) |>
+    # Keep the gene with the best overlap
+    group_by(sseqid) |>
+    slice_max(order_by = overlap_fraction, n = 1) |>
+    ungroup()
   
+  # Add back original BLAST details for the best hit
   if (nrow(result) > 0) {
+    best_hit <- blast_hit |>
+      group_by(sseqid) |>
+      slice_max(order_by = bitscore, n = 1) |>
+      ungroup()
+    
+    result <- left_join(result, best_hit, by = "sseqid")
     return(result)
   } else {
     return(NULL)
@@ -273,8 +366,8 @@ find_gene_from_blast_hit <- function(blast_hit, gff_file, min_seq_len) {
 #'
 #' This function extracts and translates gene sequences to protein sequences
 #'
-#' @param genome_dir Directory containing genome FASTA files ending with ".fasta"
-#' @param gff_file Directory containing gene annotation gff files ending with ".gff3"
+#' @param genome_file Path to the genome FASTA file
+#' @param gff_file Path to the gene annotation GFF file
 #' @param transcript_id Transcript ID corresponding to a BLAST hit
 #' @param output_dir Directory for output files
 #' @param gene_hit_path Path to BLAST gene hit files
@@ -324,31 +417,21 @@ gene_seq_to_prot <- function(genome_file,
   # Join CDS sequences
   full_transcript <- DNAString(paste(cds_seqs, collapse = ""))
   
-  # Find and translate longest ORF
-  find_and_translate_longest_ORF <- function(sequence) {
-    atg_positions <- start(matchPattern("ATG", sequence))
-    longest_protein <- ""
-    
-    for (start_pos in atg_positions) {
-      current_seq <- subseq(sequence, start_pos)
-      
-      if (length(current_seq) >= 3) {
-        protein <- translate(current_seq)
-        stop_pos <- min(c(start(matchPattern(
-          "*", protein
-        )), length(protein) + 1))
-        current_protein <- substr(as.character(protein), 1, stop_pos - 1)
-        
-        if (nchar(current_protein) > nchar(longest_protein)) {
-          longest_protein <- current_protein
-        }
-      }
-    }
-    return(longest_protein)
+  # Translate the full transcript 
+  protein <- translate(
+    full_transcript,
+    genetic.code = getGeneticCode("1"),  # Standard genetic code
+    if.fuzzy.codon = "solve"            # Handle ambiguous codons
+  )
+  
+  # Extract the protein sequence up to the first stop codon
+  protein <- as.character(protein)
+  stop_pos <- regexpr("\\*", protein)
+  if (stop_pos > 0) {
+    protein <- substr(protein, 1, stop_pos - 1)
   }
   
-  # Get protein sequence and gene name
-  protein <- find_and_translate_longest_ORF(full_transcript)
+  # Get gene name
   gene_name <- unique(as.character(mcols(cds)$Parent))
   
   # Create output directories
@@ -356,7 +439,7 @@ gene_seq_to_prot <- function(genome_file,
   transcript_output_dir_path <- file.path(output_dir, "transcript")
   for (dir in c(protein_output_dir_path, transcript_output_dir_path)) {
     if (!dir.exists(dir)) {
-      dir.create(dir)
+      dir.create(dir, recursive = TRUE)
     }
   }
   
@@ -399,7 +482,6 @@ gene_seq_to_prot <- function(genome_file,
   return(protein_out_path)
 }
 
-
 #' Verify homology between tomato and potato sequences
 #'
 #' This function performs detailed homology analysis between tomato and potato sequences.
@@ -413,13 +495,15 @@ gene_seq_to_prot <- function(genome_file,
 #' @param evalue E-value threshold for BLAST searches
 #' @param index_de DataFrame containing file relationship information
 #' @return List containing detailed comparison and summary statistics
+# Function to verify homology between tomato and potato sequences
+# Define the improved verify_tomato_potato_homology function
 verify_tomato_potato_homology <- function(output_dir,
                                           tomato_proteom = "tomato/UP000004994_4081.fasta",
                                           potato_prot,
                                           tomato_prot,
                                           evalue = 1e-5,
                                           index_de) {
-  # Validate input files and directories
+  # Input validation
   for (file in c(tomato_proteom)) {
     if (!file.exists(file)) {
       stop("File not found: ", file)
@@ -432,7 +516,7 @@ verify_tomato_potato_homology <- function(output_dir,
   }
   
   # Create output directory structure
-  homologue_verifi_path <- file.path(output_dir, "homologue_verification")
+  homologue_verifi_path <- file.path(output_dir, "homology_verification")
   tomato_proteom_db_path <- file.path(homologue_verifi_path, "blastp_database")
   potato_prot_blast_hit_path <- file.path(homologue_verifi_path, "potato_prot_blast_hit")
   tomato_prot_blast_hit_path <- file.path(homologue_verifi_path, "tomato_prot_blast_hit")
@@ -534,6 +618,12 @@ verify_tomato_potato_homology <- function(output_dir,
           "bitscore"
         )
       )
+      
+      blast_results <- filter_gene_hits(
+        blast_hits = blast_results,
+        max_distance = 10000,
+        min_bitscore = 30
+      )
       blast_results$source_file_potato <- basename(protein_seq)
       potato_results <- rbind(potato_results, blast_results)
     }
@@ -574,55 +664,79 @@ verify_tomato_potato_homology <- function(output_dir,
           "bitscore"
         )
       )
+      
+      blast_result <- filter_gene_hits(
+        blast_hits = blast_results,
+        max_distance = 10000,
+        min_bitscore = 30
+      )
+      
       blast_results$source_file_tomato <- basename(protein_seq)
       tomato_results <- rbind(tomato_results, blast_results)
     }
   }
   
-  # Generate comparison results
-  if (nrow(potato_results) > 0 && nrow(tomato_results) > 0) {
-    # Get best hits for each query
-    potato_best_hits <- potato_results |>
-      group_by(source_file_potato) |>
-      slice_max(order_by = bitscore, n = 1)
+  # Process results and create comparison with exactly one row per protein
+  if (nrow(potato_results) > 0) {
+    # Get best hits for each protein file (one hit per protein file)
+    potato_best_hits <- potato_results %>%
+      group_by(source_file_potato) %>%
+      slice_max(order_by = bitscore, n = 1) %>%
+      ungroup()
     
-    tomato_best_hits <- tomato_results |>
-      group_by(source_file_tomato) |>
-      slice_max(order_by = bitscore, n = 1)
+    # If tomato results exist, prepare them
+    if (nrow(tomato_results) > 0) {
+      tomato_best_hits <- tomato_results %>%
+        group_by(source_file_tomato) %>%
+        slice_max(order_by = bitscore, n = 1) %>%
+        ungroup()
+    } else {
+      tomato_best_hits <- data.frame(
+        sseqid = character(0),
+        pident_tomato = numeric(0),
+        length_tomato = numeric(0),
+        bitscore_tomato = numeric(0),
+        source_file_tomato = character(0)
+      )
+    }
     
-    # Compare hits and join with index_de information
-    comparison <- potato_best_hits |>
-      left_join(tomato_best_hits,
-                by = "sseqid",
-                suffix = c("_potato", "_tomato")) |>
+    comparison <- index_de |>
+      mutate(protein_out_path_base = basename(protein_out_path)) |>
+      left_join(potato_best_hits,
+                by = c("protein_out_path_base" = "source_file_potato")) |>
+      mutate(query_path_base = basename(query_path)) |>
       left_join(
-        select(index_de, blast_hit_file_path, gene_hit_path, query_path),
-        by = c("source_file_potato" = "blast_hit_file_path")
+        tomato_best_hits,
+        by = c("query_path_base" = "source_file_tomato"),
+        suffix = c("_target", "_query")
       ) |>
+      # Calculate match metrics
       mutate(
         match_quality = case_when(
-          is.na(bitscore_tomato) ~ "No Match",
-          pident_potato >= 90 &
-            pident_potato / pident_tomato >= 0.9 ~ "Strong Homolog",
-          pident_potato >= 70 &
-            pident_potato / pident_tomato >= 0.7 ~ "Moderate Homolog",
-          pident_potato >= 50 &
-            pident_potato / pident_tomato >= 0.5 ~ "Weak Homolog",
+          is.na(bitscore_query) ~ "No Match",
+          pident_target >= 70 &
+            !is.na(pident_query) & pident_query > 0 &
+            pident_target / pident_query >= 0.7 ~ "Strong Homologue",
+          pident_target >= 50 &
+            !is.na(pident_query) & pident_query > 0 &
+            pident_target / pident_query >= 0.5 ~ "Moderate Homologue",
+          pident_target >= 30 &
+            !is.na(pident_query) & pident_query > 0 &
+            pident_target / pident_query >= 0.3 ~ "Weak Homologue",
           TRUE ~ "Poor Match"
         ),
-        similarity_ratio = pident_potato / pident_tomato,
-        coverage_ratio = length_potato / length_tomato
+        similarity_ratio = ifelse(
+          !is.na(pident_query) & pident_query > 0,
+          pident_target / pident_query,
+          NA
+        ),
+        coverage_ratio = ifelse(
+          !is.na(length_query) & length_query > 0,
+          length_target / length_query,
+          NA
+        )
       )
     
-    # Generate summary statistics
-    summary_stats <- comparison |>
-      group_by(match_quality) |>
-      summarise(
-        count = n(),
-        avg_similarity = mean(similarity_ratio, na.rm = TRUE),
-        avg_coverage = mean(coverage_ratio, na.rm = TRUE),
-        .groups = "drop"
-      )
     
     # Write results to files
     write_csv(
@@ -632,20 +746,14 @@ verify_tomato_potato_homology <- function(output_dir,
         "homology_comparison_detailed.csv"
       )
     )
-    write_csv(
-      summary_stats,
-      file.path(homologue_verifi_path, "homology_summary_stats.csv")
-    )
     
-    return(list(
-      detailed_comparison = comparison,
-      summary_statistics = summary_stats
-    ))
+    return(comparison)
   } else {
     warning("No BLAST results found for comparison")
     return(NULL)
   }
 }
+
 
 #' Main execution function for ProBLASTr pipeline
 #'
@@ -664,7 +772,7 @@ main <- function(genome_dir,
                  gff_dir,
                  output_dir,
                  evalue = 1e-5,
-                 min_seq_len = 50000,
+                 min_seq_len = min_seq_len,
                  tomato_proteom = "tomato/UP000004994_4081.fasta") {
   # Check required parameters
   if (missing(genome_dir) ||
@@ -727,7 +835,7 @@ main <- function(genome_dir,
       col.names = c(
         "qseqid",
         "sseqid",
-        "percent_identity",
+        "pident",
         "length",
         "mismatch",
         "gapopen",
@@ -745,9 +853,9 @@ main <- function(genome_dir,
     blast_hit_unique_sseqid <- paste(unique(blast_hit_table$sseqid), collapse = "|")
     matching_gff_file <- system2("egrep",
                                  args = c(
-                                   "-l",
+                                   "-l", "-r",
                                    shQuote(blast_hit_unique_sseqid),
-                                   file.path(gff_dir, "*")
+                                   gff_dir
                                  ),
                                  stdout = TRUE)
     
@@ -810,6 +918,7 @@ main <- function(genome_dir,
   
   # Save backup of current index
   write_csv(index, file = "index.csv.bak")
+  write_csv(index_blast, file = "index_blast.csv.bak")
   
   # Update file paths in index
   # Update file paths in index
@@ -817,9 +926,16 @@ main <- function(genome_dir,
   index_from_file$genome_file_path <- file.path(genome_dir, index_from_file$genome_file_path)
   
   # Join indices to create complete relationship map
-  index_de <- left_join(index, index_from_file, by = "gff_file_path") |>
-    na.omit() |>
-    left_join(index_blast, by = "blast_hit_file_path")
+  index_de <- index |>
+    # First join index with index_from_file
+    inner_join(index_from_file, by = "gff_file_path") |>
+    left_join(index_blast, by = "blast_hit_file_path") |>
+    filter(grepl("\\.fasta$", query_path)) |>
+    filter(!grepl("\\.gff3$", query_path))
+  
+  # Add Genome column
+  index_de <- index_de |>
+    mutate(genome = basename(genome_file_path))
   
   # Set up for protein sequence generation
   protein_output_dir_path <- file.path(output_dir, "protein")
@@ -897,7 +1013,7 @@ main <- function(genome_dir,
   message("\nUpdating final index with protein information...")
   tryCatch({
     index_de <- index_de |>
-      left_join(gene_to_prot_index, by = "gene_hit_path")
+      full_join(gene_to_prot_index, by = "gene_hit_path")
   }, error = function(e) {
     warning(sprintf("Error joining protein information: %s", e$message))
   })
@@ -927,14 +1043,17 @@ main <- function(genome_dir,
   })
 }
 
-# Example usage of the main function
-if (T) {
-  # Set to TRUE to run
-  results <- main(
-    genome_dir = "genomes",
-    query_dir = "meiotic_genes_protein_fasta",
-    gff_dir = "gff_files",
-    output_dir = "out_2024_02_18",
-    evalue = 1e-5
-  )
-}
+
+# call main func ----------------------------------------------------------
+# example
+# add index from file as an parameter
+results <- main(
+  genome_dir = "genomes/new_genomes",
+  query_dir = "meiotic_genes_protein_fasta/test_meiotic_prot", 
+  gff_dir = "gff_files",
+  output_dir = "out_2024_02_24",
+  evalue = 1e-5,
+  min_seq_len = 50000,
+  tomato_proteom = "tomato/UP000004994_4081.fasta"
+)
+
