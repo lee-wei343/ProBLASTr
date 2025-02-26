@@ -1,7 +1,7 @@
 # Script Name: ProBLASTr.R
 # Description: An R script for protein BLAST analysis and homology verification
 #
-# Copyright (C) [2025] [University of Cologne]
+# Copyright (C) [2025]
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -21,12 +21,13 @@
 # [Your Email]
 # Univeristy of Cologne
 #
-# Version: 0.9
-# Last Updated: [2025.02.21]
+# Version: 1.0
+# Last Updated: [2025.02.26]
 #
 # Project Repository: [URL to your repository]
 #
 # Dependencies:
+# some missing
 # blastn: 2.16.0+
 #   Package: blast 2.16.0, build Aug  7 2024 01:45:09
 #
@@ -84,23 +85,13 @@
 
 # Load required libraries
 library(tidyverse)
-library(GenomicRanges)
 library(Biostrings)
-library(GenomicFeatures)
+library(GenomicRanges)
 library(rtracklayer)
-library(Rsamtools)
-library(stringi)
+library(stringr)
+library(msa)
 
-# error_log <- function() {
-#   cat(format(Sys.time()),
-#       geterrmessage(),
-#       "\n",
-#       file = "error_log.txt",
-#       append = T)
-# }
-# 
-# # Error handling configuration
-# options(error = error_log)
+# -- BLAST Database Functions ----------------------------------------------------------
 
 #' Create BLAST database and run tBLASTn search
 #'
@@ -162,7 +153,7 @@ create_blastdb_and_run_tblastn <- function(genome_dir,
         "-dbtype",
         dbtype,
         "-out",
-        db_name #,"-parse_seqids" error header longer than 50
+        db_name
       )
     )
     # keep track of the database paths
@@ -180,13 +171,16 @@ create_blastdb_and_run_tblastn <- function(genome_dir,
   # Initialize index for successful BLAST runs
   index_blast <- data.frame(
     query_path = character(0),
-    blast_hit_file_path = character(0)
+    blast_hit_file_path = character(0),
+    genome_file = character(0)
   )
   
   # Run BLAST for each query against each database
   for (query in query_files) {
     query_name <- tools::file_path_sans_ext(basename(query))
-    for (db in db_paths) {
+    for (i in seq_along(db_paths)) {
+      db <- db_paths[i]
+      genome_file <- genome_files[i]
       message(sprintf("Query: '%s'\nDb: '%s'\n", query, db))
       
       db_name <- basename(db)
@@ -221,7 +215,8 @@ create_blastdb_and_run_tblastn <- function(genome_dir,
           index_blast,
           data.frame(
             query_path = query,
-            blast_hit_file_path = output_file
+            blast_hit_file_path = output_file,
+            genome_file = genome_file
           )
         )
       }
@@ -231,829 +226,545 @@ create_blastdb_and_run_tblastn <- function(genome_dir,
   return(index_blast)
 }
 
-#' Filter genes from BLAST hits
-filter_gene_hits <- function(blast_hits, max_distance = 10000, 
-                             min_bitscore = 30) {
-  if (nrow(blast_hits) == 0) return(blast_hits)
-  
-  # First, filter by minimum bit score
-  quality_hits <- blast_hits |>
-    filter(bitscore >= min_bitscore)
-  
-  if (nrow(quality_hits) == 0) return(quality_hits)
-  
-  # Group hits by chromosome
-  hits_by_chrom <- split(quality_hits, quality_hits$sseqid)
-  
-  result <- data.frame()
-  
-  for (chrom in names(hits_by_chrom)) {
-    chrom_hits <- hits_by_chrom[[chrom]]
-    
-    # Sort by position
-    chrom_hits <- chrom_hits |>
-      mutate(
-        hit_start = pmin(sstart, send),
-        hit_end = pmax(sstart, send)
-      ) |>
-      arrange(hit_start)
-    
-    # If there's only one hit for this chromosome, keep it and continue
-    if (nrow(chrom_hits) == 1) {
-      result <- rbind(result, chrom_hits)
-      next
-    }
-    
-    # Check if hits are close enough to be from the same gene
-    is_same_gene <- TRUE
-    for (i in 2:nrow(chrom_hits)) {
-      # Check for NA values before comparison
-      if (is.na(chrom_hits$hit_start[i]) || is.na(chrom_hits$hit_end[i-1])) {
-        is_same_gene <- FALSE
-        break
-      }
-      
-      if (chrom_hits$hit_start[i] - chrom_hits$hit_end[i-1] > max_distance) {
-        is_same_gene <- FALSE
-        break
-      }
-    }
-    
-    # If they appear to be from the same gene, retain all hits
-    # Otherwise, keep only the best hit
-    if (is_same_gene) {
-      result <- rbind(result, chrom_hits)
-    } else {
-      best_hit <- chrom_hits |>
-        slice_max(order_by = bitscore, n = 1)
-      result <- rbind(result, best_hit)
-    }
-  }
-  
-  return(result)
-}
+# -- Sequence Translation Functions ---------------------------------------------------
 
-
-#' Find genes from BLAST hits
+#' Extract and translate DNA sequence for every BLAST hit
 #'
-#' This function identifies genes corresponding to BLAST hits
-#' 
-#' @param blast_hit DataFrame containing a BLAST hit with the column sseqid
-#' @param gff_file Directory containing Gene Annotation gff files ending with ".gff3"
-#' @param min_seq_len Minimum sequence length between sequences
-#' @return DataFrame containing BLAST hit and Gene names from the corresponfing gff_file if it has at least one row otherwise NULL
-find_gene_from_blast_hit <- function(blast_hit, gff_file, min_seq_len) {
-  
-  # First, apply our filtering function
-  filtered_blast_hits <- filter_gene_hits(blast_hit, max_distance = min_seq_len, min_bitscore = 30)
-  
-  # Now proceed with coordinate-based matching as before
-  filtered_blast_hit <- filtered_blast_hits |>
-    mutate(low_start = pmin(sstart, send),
-           high_end = pmax(sstart, send)) |>
-    group_by(sseqid) |>
-    ungroup() |>
-    dplyr::select(-contains("idk"),
-                  low_start,
-                  high_end)
-  
-  # Find the gene(s) that encompass all these hits
-  hit_ranges <- filtered_blast_hit |>
-    group_by(sseqid) |>
-    summarize(
-      min_pos = min(low_start),
-      max_pos = max(high_end)
-    )
-  
-  # Match with gene annotations
-  result <- inner_join(hit_ranges,
-                       gff_file,
-                       by = "sseqid",
-                       relationship = "many-to-many") |>
-    filter(
-      # Gene must overlap with our hit range
-      !(min_pos > gend | max_pos < gstart)
-    ) |>
-    # Calculate what percentage of our hits the gene covers
-    mutate(
-      overlap_start = pmax(min_pos, gstart),
-      overlap_end = pmin(max_pos, gend),
-      overlap_length = overlap_end - overlap_start,
-      hit_length = max_pos - min_pos,
-      overlap_fraction = overlap_length / hit_length
-    ) |>
-    filter(overlap_fraction >= 0.5) |>
-    # Keep the gene with the best overlap
-    group_by(sseqid) |>
-    slice_max(order_by = overlap_fraction, n = 1) |>
-    ungroup()
-  
-  # Add back original BLAST details for the best hit
-  if (nrow(result) > 0) {
-    best_hit <- blast_hit |>
-      group_by(sseqid) |>
-      slice_max(order_by = bitscore, n = 1) |>
-      ungroup()
-    
-    result <- left_join(result, best_hit, by = "sseqid")
-    return(result)
-  } else {
-    return(NULL)
-  }
-}
-
-#' Convert gene sequence to protein
-#'
-#' This function extracts and translates gene sequences to protein sequences
-#'
+#' @param blast_hit_file Path to the BLAST hit TSV file
 #' @param genome_file Path to the genome FASTA file
-#' @param gff_file Path to the gene annotation GFF file
-#' @param transcript_id Transcript ID corresponding to a BLAST hit
 #' @param output_dir Directory for output files
-#' @param gene_hit_path Path to BLAST gene hit files
-#' @return Path to the protein sequence
-gene_seq_to_prot <- function(genome_file,
-                             gff_file,
-                             transcript_id,
-                             output_dir,
-                             gene_hit_path) {
-  message("Processing gene to protein conversion...")
-  message("genome_file = ", genome_file)
-  message("gff_file = ", gff_file)
-  message("transcript_id = ", transcript_id)
-  message("output_dir = ", output_dir)
-  
-  # Read and filter GFF file
-  gff <- import(gff_file)
-  gff <- gff[gff$type == "CDS"]
-  cds <- gff[as.character(gff$Parent) == transcript_id]
-  
-  # Sort CDS based on strand
-  if (unique(strand(cds)) == "-") {
-    cds <- sort(cds, decreasing = TRUE)
-  } else {
-    cds <- sort(cds)
+#' @param extend_bp Number of base pairs to extend the hit region (to capture complete coding frames)
+#' @return DataFrame with paths to translated protein sequences
+translate_blast_hits <- function(blast_hit_file, genome_file, output_dir, extend_bp = 300) {
+  # Create output directory
+  protein_dir <- file.path(output_dir, "direct_translations")
+  if (!dir.exists(protein_dir)) {
+    dir.create(protein_dir, recursive = TRUE)
   }
   
-  # Extract sequences
-  fa <- FaFile(genome_file)
-  cds_seqs <- sapply(seq_along(cds), function(i) {
-    chr <- as.character(seqnames(cds[i]))
-    start <- start(cds[i])
-    end <- end(cds[i])
-    
-    seq <- scanFa(fa, param = GRanges(
-      seqnames = chr,
-      ranges = IRanges(start = start, end = end)
-    ))
-    
-    if (as.character(strand(cds[i])) == "-") {
-      seq <- reverseComplement(seq)
-    }
-    
-    return(as.character(seq))
+  # Read BLAST hits
+  tryCatch({
+    hits <- read.table(
+      file = blast_hit_file,
+      sep = "\t",
+      col.names = c(
+        "qseqid", "sseqid", "pident", "length", "mismatch", 
+        "gapopen", "qstart", "qend", "sstart", "send", 
+        "evalue", "bitscore"
+      )
+    )
+  }, error = function(e) {
+    warning(paste("Error reading BLAST hit file:", blast_hit_file, "-", e$message))
+    return(data.frame())
   })
   
-  # Join CDS sequences
-  full_transcript <- DNAString(paste(cds_seqs, collapse = ""))
-  
-  # Translate the full transcript 
-  protein <- translate(
-    full_transcript,
-    genetic.code = getGeneticCode("1"),  # Standard genetic code
-    if.fuzzy.codon = "solve"            # Handle ambiguous codons
-  )
-  
-  # Extract the protein sequence up to the first stop codon
-  protein <- as.character(protein)
-  stop_pos <- regexpr("\\*", protein)
-  if (stop_pos > 0) {
-    protein <- substr(protein, 1, stop_pos - 1)
+  if (nrow(hits) == 0) {
+    return(data.frame())
   }
   
-  # Get gene name
-  gene_name <- unique(as.character(mcols(cds)$Parent))
+  # Load genome
+  tryCatch({
+    genome <- readDNAStringSet(genome_file)
+    names(genome) <- sub(" .*", "", names(genome))
+  }, error = function(e) {
+    warning(paste("Error reading genome file:", genome_file, "-", e$message))
+    return(data.frame())
+  })
   
-  # Create output directories
-  protein_output_dir_path <- file.path(output_dir, "protein")
-  transcript_output_dir_path <- file.path(output_dir, "transcript")
-  for (dir in c(protein_output_dir_path, transcript_output_dir_path)) {
-    if (!dir.exists(dir)) {
-      dir.create(dir, recursive = TRUE)
-    }
-  }
-  
-  # Write protein sequence
-  protein_header <- paste0(
-    ">",
-    gene_name,
-    " Gene hit: ",
-    basename(gene_hit_path),
-    " Genome: ",
-    basename(genome_file),
-    " gff_file: ",
-    basename(gff_file),
-    " - Longest Open Reading Frame"
-  )
-  protein_out_path <- file.path(protein_output_dir_path,
-                                paste0(gene_name, "_protein.fasta"))
-  writeLines(c(protein_header, protein), protein_out_path)
-  
-  # Write transcript sequence
-  transcript_header <- paste0(
-    ">",
-    gene_name,
-    " Gene hit: ",
-    basename(gene_hit_path),
-    " Genome: ",
-    basename(genome_file),
-    " gff_file: ",
-    basename(gff_file),
-    " - Full Transcript Sequence"
-  )
-  writeLines(
-    c(transcript_header, as.character(full_transcript)),
-    file.path(
-      transcript_output_dir_path,
-      paste0(gene_name, "_transcript.fasta")
-    )
+  results <- data.frame(
+    hit_id = character(0),
+    protein_file = character(0),
+    frame = integer(0),
+    aa_length = integer(0),
+    query_id = character(0),
+    hit_chromosome = character(0),
+    hit_start = integer(0),
+    hit_end = integer(0),
+    e_value = numeric(0),
+    percent_identity = numeric(0)
   )
   
-  return(protein_out_path)
-}
-
-#' Verify homology between tomato and potato sequences
-#'
-#' This function performs detailed homology analysis between tomato and potato sequences.
-#' It creates BLAST databases, performs comparisons, and generates comprehensive reports
-#' of the relationships between sequences.
-#'
-#' @param output_dir Directory for output files
-#' @param tomato_proteom Path to tomato proteome reference file
-#' @param potato_prot Directory containing potato protein sequences
-#' @param tomato_prot Directory containing tomato protein sequences
-#' @param evalue E-value threshold for BLAST searches
-#' @param index_de DataFrame containing file relationship information
-#' @return List containing detailed comparison and summary statistics
-# Function to verify homology between tomato and potato sequences
-# Define the improved verify_tomato_potato_homology function
-verify_tomato_potato_homology <- function(output_dir,
-                                          tomato_proteom = "tomato/UP000004994_4081.fasta",
-                                          potato_prot,
-                                          tomato_prot,
-                                          evalue = 1e-5,
-                                          index_de) {
-  # Input validation
-  for (file in c(tomato_proteom)) {
-    if (!file.exists(file)) {
-      stop("File not found: ", file)
-    }
-  }
-  for (dir in c(potato_prot, tomato_prot)) {
-    if (!dir.exists(dir)) {
-      stop("Directory not found: ", dir)
-    }
-  }
-  
-  # Create output directory structure
-  homologue_verifi_path <- file.path(output_dir, "homology_verification")
-  tomato_proteom_db_path <- file.path(homologue_verifi_path, "blastp_database")
-  potato_prot_blast_hit_path <- file.path(homologue_verifi_path, "potato_prot_blast_hit")
-  tomato_prot_blast_hit_path <- file.path(homologue_verifi_path, "tomato_prot_blast_hit")
-  
-  for (dir in c(
-    homologue_verifi_path,
-    tomato_proteom_db_path,
-    potato_prot_blast_hit_path,
-    tomato_prot_blast_hit_path
-  )) {
-    if (!dir.exists(dir)) {
-      dir.create(dir, recursive = TRUE)
-    }
-  }
-  
-  # Create BLAST database from tomato proteome
-  message("Creating BLAST database from tomato proteome...")
-  proteom_db_path <- file.path(tomato_proteom_db_path,
-                               paste0(tools::file_path_sans_ext(basename(tomato_proteom)), "_db"))
-  system2(
-    "makeblastdb",
-    args = c(
-      "-in",
-      tomato_proteom,
-      "-dbtype",
-      "prot",
-      "-out",
-      proteom_db_path
-    )
-  )
-  
-  # Helper function to perform BLAST searches
-  blastp <- function(query, db, out, evalue = 1e-5) {
-    message("Running BLAST for query: ", basename(query))
-    tryCatch({
-      system2(
-        "blastp",
-        args = c(
-          "-query",
-          query,
-          "-db",
-          db,
-          "-out",
-          out,
-          "-evalue",
-          evalue,
-          "-outfmt",
-          "\"6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore\""
-        )
+  # Process each hit
+  for (i in 1:nrow(hits)) {
+    hit <- hits[i, ]
+    
+    # Determine coordinates, accounting for reverse strand hits
+    is_reverse <- hit$sstart > hit$send
+    start_pos <- min(hit$sstart, hit$send) - extend_bp
+    end_pos <- max(hit$sstart, hit$send) + extend_bp
+    
+    # Ensure coordinates are valid
+    start_pos <- max(1, start_pos)
+    
+    # Only proceed if the hit chromosome is in the genome
+    if (hit$sseqid %in% names(genome)) {
+      # Extract DNA sequence
+      seq_length <- length(genome[[hit$sseqid]])
+      end_pos <- min(end_pos, seq_length)
+      dna_seq <- subseq(genome[[hit$sseqid]], start = start_pos, end = end_pos)
+      
+      # Translate in all 6 frames
+      frames <- list()
+      # Forward frames
+      frames[[1]] <- translate(dna_seq, if.fuzzy.codon = "solve")  # Frame 0
+      frames[[2]] <- translate(subseq(dna_seq, start=2), if.fuzzy.codon = "solve")  # Frame 1
+      frames[[3]] <- translate(subseq(dna_seq, start=3), if.fuzzy.codon = "solve")  # Frame 2
+      # Reverse frames
+      rev_seq <- reverseComplement(dna_seq)
+      frames[[4]] <- translate(rev_seq, if.fuzzy.codon = "solve")  # Frame 0, reverse
+      frames[[5]] <- translate(subseq(rev_seq, start=2), if.fuzzy.codon = "solve")  # Frame 1, reverse
+      frames[[6]] <- translate(subseq(rev_seq, start=3), if.fuzzy.codon = "solve")  # Frame 2, reverse
+      
+      # Find the frame that gives the longest ORF
+      orfs <- lapply(frames, function(f) {
+        # Split by stop codons
+        orfs <- strsplit(as.character(f), "\\*")[[1]]
+        # Return the longest ORF
+        return(orfs[which.max(nchar(orfs))])
+      })
+      
+      best_frame <- which.max(sapply(orfs, nchar))
+      best_orf <- orfs[[best_frame]]
+      
+      # Generate unique hit ID
+      hit_id <- paste0(
+        hit$qseqid, "_", 
+        hit$sseqid, "_", 
+        start_pos, "-", end_pos, 
+        "_frame", best_frame
       )
       
-      if (file.exists(out)) {
-        if (file.size(out) == 0) {
-          message("No BLAST hits found for: ", basename(query))
-          file.remove(out)
-          return(FALSE)
+      # Clean ID for file naming
+      clean_id <- gsub("[^a-zA-Z0-9._-]", "_", hit_id)
+      
+      # Save protein sequence to file
+      protein_file <- file.path(protein_dir, paste0(clean_id, ".fasta"))
+      writeLines(
+        c(
+          paste0(">", hit_id, " | ", 
+                 "Query:", hit$qseqid, 
+                 " Genome:", basename(genome_file),
+                 " Identity:", hit$pident, "%",
+                 " E-value:", hit$evalue),
+          best_orf
+        ),
+        protein_file
+      )
+      
+      # Record result
+      results <- rbind(
+        results,
+        data.frame(
+          hit_id = hit_id,
+          protein_file = protein_file,
+          frame = best_frame,
+          aa_length = nchar(best_orf),
+          query_id = hit$qseqid,
+          hit_chromosome = hit$sseqid,
+          hit_start = start_pos,
+          hit_end = end_pos,
+          e_value = hit$evalue,
+          percent_identity = hit$pident
+        )
+      )
+    }
+  }
+  
+  return(results)
+}
+
+# -- Sequence Analysis Functions -----------------------------------------------------
+#' Align translated sequences with original query sequences
+#'
+#' @param protein_file Path to the translated protein sequence file
+#' @param query_file Path to the original query protein file
+#' @param output_dir Directory for output files
+#' @return Path to the alignment file
+align_sequences <- function(protein_file, query_file, output_dir) {
+  
+  align_dir <- file.path(output_dir, "alignments")
+  
+  if (!(dir.exists(align_dir))) {
+    dir.create(align_dir, recursive = TRUE)
+  }
+  
+  # Generate output file name
+  alignment_name <- paste0(
+    tools::file_path_sans_ext(basename(protein_file)), 
+    "_vs_", 
+    tools::file_path_sans_ext(basename(query_file)),
+    ".aln"
+  )
+  alignment_file <- file.path(align_dir, alignment_name)
+  
+  # Read sequences
+  tryCatch({
+    protein_seq <- readAAStringSet(protein_file)
+    query_seq <- readAAStringSet(query_file)
+    
+    # If there are multiple sequences in the query file, try to find the right one
+    if (length(query_seq) > 1) {
+      # Extract query ID from protein file header
+      protein_header <- names(protein_seq)[1]
+      query_id_match <- str_extract(protein_header, "Query:[^\\s|]+")
+      if (!is.na(query_id_match)) {
+        query_id <- gsub("Query:", "", query_id_match)
+        # Find the matching query sequence
+        matching_indices <- grep(query_id, names(query_seq))
+        if (length(matching_indices) > 0) {
+          query_seq <- query_seq[matching_indices[1]]
+        } else {
+          # If no match found, just use the first query sequence
+          query_seq <- query_seq[1]
         }
-        return(TRUE)
+      } else {
+        # If no query ID found in header, use the first query sequence
+        query_seq <- query_seq[1]
       }
-      return(FALSE)
-    }, error = function(e) {
-      warning("BLAST failed for query: ", query, "\nError: ", e$message)
-      return(FALSE)
-    })
-  }
-  
-  # Process potato proteins
-  message("\nProcessing potato proteins...")
-  potato_results <- data.frame()
-  potato_files <- list.files(potato_prot, pattern = "_protein.fasta$", full.names = TRUE)
-  
-  for (protein_seq in potato_files) {
-    output_file <- file.path(
-      potato_prot_blast_hit_path,
-      paste0(
-        tools::file_path_sans_ext(basename(protein_seq)),
-        "_in_",
-        basename(tools::file_path_sans_ext(tomato_proteom)),
-        ".tsv"
-      )
-    )
-    
-    if (blastp(protein_seq, proteom_db_path, output_file, evalue)) {
-      blast_results <- read.table(
-        output_file,
-        sep = "\t",
-        col.names = c(
-          "qseqid",
-          "sseqid",
-          "pident",
-          "length",
-          "mismatch",
-          "gapopen",
-          "qstart",
-          "qend",
-          "sstart",
-          "send",
-          "evalue",
-          "bitscore"
-        )
-      )
-      
-      blast_results <- filter_gene_hits(
-        blast_hits = blast_results,
-        max_distance = 10000,
-        min_bitscore = 30
-      )
-      blast_results$source_file_potato <- basename(protein_seq)
-      potato_results <- rbind(potato_results, blast_results)
-    }
-  }
-  
-  # Process tomato proteins
-  message("\nProcessing tomato proteins...")
-  tomato_results <- data.frame()
-  tomato_files <- list.files(tomato_prot, pattern = "\\.fasta$", full.names = TRUE)
-  
-  for (protein_seq in tomato_files) {
-    output_file <- file.path(
-      tomato_prot_blast_hit_path,
-      paste0(
-        tools::file_path_sans_ext(basename(protein_seq)),
-        "_in_",
-        basename(tools::file_path_sans_ext(tomato_proteom)),
-        ".tsv"
-      )
-    )
-    
-    if (blastp(protein_seq, proteom_db_path, output_file, evalue)) {
-      blast_results <- read.table(
-        output_file,
-        sep = "\t",
-        col.names = c(
-          "qseqid",
-          "sseqid",
-          "pident",
-          "length",
-          "mismatch",
-          "gapopen",
-          "qstart",
-          "qend",
-          "sstart",
-          "send",
-          "evalue",
-          "bitscore"
-        )
-      )
-      
-      blast_result <- filter_gene_hits(
-        blast_hits = blast_results,
-        max_distance = 10000,
-        min_bitscore = 30
-      )
-      
-      blast_results$source_file_tomato <- basename(protein_seq)
-      tomato_results <- rbind(tomato_results, blast_results)
-    }
-  }
-  
-  # Process results and create comparison with exactly one row per protein
-  if (nrow(potato_results) > 0) {
-    # Get best hits for each protein file (one hit per protein file)
-    potato_best_hits <- potato_results %>%
-      group_by(source_file_potato) %>%
-      slice_max(order_by = bitscore, n = 1) %>%
-      ungroup()
-    
-    # If tomato results exist, prepare them
-    if (nrow(tomato_results) > 0) {
-      tomato_best_hits <- tomato_results %>%
-        group_by(source_file_tomato) %>%
-        slice_max(order_by = bitscore, n = 1) %>%
-        ungroup()
-    } else {
-      tomato_best_hits <- data.frame(
-        sseqid = character(0),
-        pident_tomato = numeric(0),
-        length_tomato = numeric(0),
-        bitscore_tomato = numeric(0),
-        source_file_tomato = character(0)
-      )
     }
     
-    comparison <- index_de |>
-      mutate(protein_out_path_base = basename(protein_out_path)) |>
-      left_join(potato_best_hits,
-                by = c("protein_out_path_base" = "source_file_potato")) |>
-      mutate(query_path_base = basename(query_path)) |>
-      left_join(
-        tomato_best_hits,
-        by = c("query_path_base" = "source_file_tomato"),
-        suffix = c("_target", "_query")
-      ) |>
-      # Calculate match metrics
-      mutate(
-        match_quality = case_when(
-          is.na(bitscore_query) ~ "No Match",
-          pident_target >= 70 &
-            !is.na(pident_query) & pident_query > 0 &
-            pident_target / pident_query >= 0.7 ~ "Strong Homologue",
-          pident_target >= 50 &
-            !is.na(pident_query) & pident_query > 0 &
-            pident_target / pident_query >= 0.5 ~ "Moderate Homologue",
-          pident_target >= 30 &
-            !is.na(pident_query) & pident_query > 0 &
-            pident_target / pident_query >= 0.3 ~ "Weak Homologue",
-          TRUE ~ "Poor Match"
-        ),
-        similarity_ratio = ifelse(
-          !is.na(pident_query) & pident_query > 0,
-          pident_target / pident_query,
-          NA
-        ),
-        coverage_ratio = ifelse(
-          !is.na(length_query) & length_query > 0,
-          length_target / length_query,
-          NA
-        )
-      )
+    # Add a description to indicate which is query and which is translated hit
+    names(protein_seq) <- paste0(names(protein_seq), " [TRANSLATED]")
+    names(query_seq) <- paste0(names(query_seq), " [QUERY]")
     
+    # Combine sequences
+    combined_seqs <- c(query_seq, protein_seq)
     
-    # Write results to files
-    write_csv(
-      comparison,
-      file.path(
-        homologue_verifi_path,
-        "homology_comparison_detailed.csv"
-      )
+    # Perform alignment using MUSCLE algorithm from msa package
+    alignment <- msa(combined_seqs, method = "Muscle")
+    
+    # Write alignment as FASTA file instead of CLUSTAL format
+    # This is the key change - using "fasta" format instead of "clustal"
+    writeXStringSet(
+      as(alignment, "AAStringSet"),
+      filepath = alignment_file,
+      format = "fasta"  # Changed from "clustal" to "fasta"
     )
     
-    return(comparison)
-  } else {
-    warning("No BLAST results found for comparison")
-    return(NULL)
-  }
+    # Check if alignment file was created successfully
+    if (!file.exists(alignment_file) || file.size(alignment_file) == 0) {
+      warning("Alignment failed for ", basename(protein_file))
+      return(NA)
+    }
+    
+    return(alignment_file)
+    
+  }, error = function(e) {
+    warning("Error performing alignment: ", e$message)
+    return(NA)
+  })
 }
 
-
-#' Main execution function for ProBLASTr pipeline
+#' Run HMMER search to identify domains in protein sequences
 #'
-#' This function runs the entire ProBLASTr workflow, from initial BLAST searches 
-#' through gene finding, protein sequence translation and homology verification.
-#'
-#' @param genome_dir Directory containing genome files
-#' @param query_dir Directory containing query files
-#' @param gff_file Directory containing gene annotation gff files ending with ".gff3"
+#' @param protein_file Path to the protein sequence file
+#' @param hmm_db Path to the HMMER database (Pfam-A.hmm)
 #' @param output_dir Directory for output files
-#' @param evalue E-value threshold for BLAST searches
-#' @param min_seq_len Minimum sequence length to consider
-#' @param tomato_proteom Path to tomato proteome reference file
+#' @param evalue E-value threshold for domain hits
+#' @return Path to the HMMER output file
+identify_domains <- function(protein_file, hmm_db, output_dir, evalue = 1e-3) {
+  # Create domains directory
+  domains_dir <- file.path(output_dir, "domains")
+  if (!dir.exists(domains_dir)) {
+    dir.create(domains_dir, recursive = TRUE)
+  }
+  
+  # Generate output file name
+  output_name <- paste0(tools::file_path_sans_ext(basename(protein_file)), "_domains.txt")
+  output_file <- file.path(domains_dir, output_name)
+  
+  # Run hmmscan
+  tryCatch({
+    system2(
+      "hmmscan",
+      args = c(
+        "--domtblout", output_file,
+        "-E", evalue,
+        "--cpu", 2,
+        hmm_db,
+        protein_file
+      )
+    )
+    
+    # Check if output file was created successfully
+    if (!file.exists(output_file) || file.size(output_file) == 0) {
+      warning("No domains found in ", basename(protein_file))
+      # Create empty file with header to indicate no domains found
+      writeLines("# No domains found", output_file)
+    }
+    
+  }, error = function(e) {
+    warning("Error running HMMER: ", e$message)
+    return(NA)
+  })
+  
+  return(output_file)
+}
+
+#' Parse HMMER domain output into a data frame
+#'
+#' @param domain_file Path to the HMMER domain output file
+#' @return Data frame containing domain information
+parse_domain_file <- function(domain_file) {
+  # Check if file exists and is not empty
+  if (!file.exists(domain_file) || file.size(domain_file) == 0) {
+    return(data.frame())
+  }
+  
+  # Read domain file
+  lines <- readLines(domain_file)
+  
+  # Filter out comment lines
+  lines <- lines[!grepl("^#", lines)]
+  
+  # If no content lines, return empty data frame
+  if (length(lines) == 0) {
+    return(data.frame())
+  }
+  
+  # Parse each line
+  domains <- lapply(lines, function(line) {
+    # Split by whitespace
+    fields <- strsplit(line, "\\s+")[[1]]
+    fields <- fields[fields != ""]
+    
+    # HMMER domtblout format has specific columns
+    if (length(fields) >= 22) {
+      return(data.frame(
+        target_name = fields[1],
+        target_accession = fields[2],
+        query_name = fields[4],
+        query_accession = fields[5],
+        e_value = as.numeric(fields[6]),
+        score = as.numeric(fields[7]),
+        domain_start = as.numeric(fields[17]),
+        domain_end = as.numeric(fields[18]),
+        stringsAsFactors = FALSE
+      ))
+    } else {
+      return(NULL)
+    }
+  })
+  
+  # Combine into a single data frame
+  domains <- do.call(rbind, domains[!sapply(domains, is.null)])
+  
+  return(domains)
+}
+
+# -- Main Function -------------------------------------------------------------------
+
+#' Main function to run the complete analysis pipeline
+#'
+#' @param genome_dir Directory containing genome FASTA files
+#' @param query_dir Directory containing query protein FASTA files
+#' @param output_dir Directory for output files
+#' @param evalue E-value threshold for BLAST searches (default: 1e-5)
+#' @param extend_bp Number of base pairs to extend around each hit (default: 300)
+#' @param hmm_db Path to HMMER database for domain identification (default: NULL)
+#' @param run_alignment Whether to run sequence alignments (default: TRUE)
+#' @param run_domain_search Whether to run domain searches (default: TRUE if hmm_db is provided)
+#' @return A list containing results and summary information
 main <- function(genome_dir,
-                 query_dir,
-                 gff_dir,
-                 output_dir,
-                 evalue = 1e-5,
-                 min_seq_len = min_seq_len,
-                 tomato_proteom = "tomato/UP000004994_4081.fasta") {
-  # Check required parameters
-  if (missing(genome_dir) ||
-      missing(query_dir) ||
-      missing(gff_dir) ||
-      missing(output_dir) ||
-      missing(tomato_proteom)) {
-    stop("Required parameter missing!")
-  }
+                               query_dir,
+                               output_dir,
+                               evalue = 1e-5,
+                               extend_bp = 300,
+                               hmm_db = NULL,
+                               run_alignment = TRUE,
+                               run_domain_search = !is.null(hmm_db)) {
   
-  # Read and validate index file
-  if (!file.exists("index.csv")) {
-    stop("The file index.csv does not exist.")
-  }
-  
-  index_from_file <- read_csv(file = "index.csv", show_col_types = FALSE) |>
-    na.omit()
-  
-  if (!("gff_file_path" %in% colnames(index_from_file))) {
-    stop("index.csv must contain a column named 'gff_file_path'")
-  }
-  
-  # Create output directory
+  # Create output directory if it doesn't exist
   if (!dir.exists(output_dir)) {
     dir.create(output_dir, recursive = TRUE)
   }
   
-  # Initialize empty DataFrame for file paths
-  index <- data.frame(
-    blast_hit_file_path = character(0),
-    gff_file_path = character(0),
-    gene_hit_path = character(0)
+  # Step 1: Create BLAST databases and run searches
+  message("Step 1: Running BLAST searches...")
+  blast_index <- create_blastdb_and_run_tblastn(
+    genome_dir = genome_dir,
+    query_dir = query_dir,
+    output_dir = output_dir,
+    evalue = evalue
   )
   
-  # Run initial BLAST searches
-  index_blast <- create_blastdb_and_run_tblastn(genome_dir, query_dir, output_dir, evalue)
+  # Save the BLAST index
+  write_csv(blast_index, file.path(output_dir, "blast_index.csv"))
   
-  # Process BLAST hits
-  blast_hits <- list.files(path = file.path(output_dir, "blast_hits"),
-                           pattern = "\\.tsv$")
+  # Step 2: Translate all BLAST hits
+  message("Step 2: Translating BLAST hits to protein sequences...")
+  all_translations <- data.frame()
   
-  # Create gene hits directory
-  gene_hit_dir_path <- file.path(output_dir, "gene_hits")
-  if (!dir.exists(gene_hit_dir_path)) {
-    dir.create(gene_hit_dir_path, recursive = TRUE)
-  }
-  
-  # Process each BLAST hit
-  for (blast_hit in blast_hits) {
-    message("Searching gff3 files for annotated genes for blast hit: '",
-            blast_hit,
-            "'...")
+  for (i in 1:nrow(blast_index)) {
+    blast_hit_file <- blast_index$blast_hit_file_path[i]
+    genome_file <- blast_index$genome_file[i]
+    query_file <- blast_index$query_path[i]
     
-    blast_hit_file_path <- file.path(output_dir, "blast_hits", blast_hit)
+    message(paste0("Processing hit file ", i, " of ", nrow(blast_index), ": ", 
+                   basename(blast_hit_file)))
     
-    # Read and process BLAST results
-    blast_hit_table <- read.table(
-      file = blast_hit_file_path,
-      sep = "\t",
-      col.names = c(
-        "qseqid",
-        "sseqid",
-        "pident",
-        "length",
-        "mismatch",
-        "gapopen",
-        "qstart",
-        "qend",
-        "sstart",
-        "send",
-        "evalue",
-        "bitscore"
-      )
-    ) |>
-      mutate(sseqid = as.character(sseqid))
-    
-    # Find matching GFF files
-    blast_hit_unique_sseqid <- paste(unique(blast_hit_table$sseqid), collapse = "|")
-    matching_gff_file <- system2("egrep",
-                                 args = c(
-                                   "-l", "-r",
-                                   shQuote(blast_hit_unique_sseqid),
-                                   gff_dir
-                                 ),
-                                 stdout = TRUE)
-    
-    # Process each matching GFF file
-    for (gff_file_hit in basename(matching_gff_file)) {
-      gff_file_path <- file.path(gff_dir, gff_file_hit)
-      
-      # Read and process GFF file
-      gff_file_table <- read.table(
-        file = gff_file_path,
-        sep = "\t",
-        col.names = c(
-          "sseqid",
-          "source",
-          "type",
-          "gstart",
-          "gend",
-          "score",
-          "strand",
-          "phase",
-          "gname"
-        )
-      ) |>
-        mutate(sseqid = as.character(sseqid)) |>
-        filter(type %in% c("mRNA", "transcript"))
-      
-      # Find genes from BLAST hits
-      result <- find_gene_from_blast_hit(
-        blast_hit = blast_hit_table,
-        gff_file = gff_file_table,
-        min_seq_len = min_seq_len
-      )
-      
-      if (!is.null(result) &&
-          is.data.frame(result) && nrow(result) > 0) {
-        gene_hit_file_path <- file.path(
-          gene_hit_dir_path,
-          paste0(
-            tools::file_path_sans_ext(blast_hit),
-            "_with_",
-            tools::file_path_sans_ext(gff_file_hit),
-            "_gene_hit.csv"
-          )
-        )
-        
-        write_csv(result, file = gene_hit_file_path)
-        
-        # Update index
-        index <- rbind(
-          index,
-          data.frame(
-            blast_hit_file_path = blast_hit_file_path,
-            gff_file_path = gff_file_path,
-            gene_hit_path = gene_hit_file_path
-          )
-        )
-      }
-    }
-  }
-  
-  # Save backup of current index
-  write_csv(index, file = "index.csv.bak")
-  write_csv(index_blast, file = "index_blast.csv.bak")
-  
-  # Update file paths in index
-  # Update file paths in index
-  index_from_file$gff_file_path <- file.path(gff_dir, index_from_file$gff_file_path)
-  index_from_file$genome_file_path <- file.path(genome_dir, index_from_file$genome_file_path)
-  
-  # Join indices to create complete relationship map
-  index_de <- index |>
-    # First join index with index_from_file
-    inner_join(index_from_file, by = "gff_file_path") |>
-    left_join(index_blast, by = "blast_hit_file_path") |>
-    filter(grepl("\\.fasta$", query_path)) |>
-    filter(!grepl("\\.gff3$", query_path))
-  
-  # Add Genome column
-  index_de <- index_de |>
-    mutate(genome = basename(genome_file_path))
-  
-  # Set up for protein sequence generation
-  protein_output_dir_path <- file.path(output_dir, "protein")
-  
-  # Initialize tracking for gene to protein conversion
-  gene_to_prot_index <- data.frame(
-    gene_hit_path = character(0),
-    transcript_id = character(0),
-    protein_out_path = character(0)
-  )
-  
-  # Process each gene hit for protein sequence generation
-  message("\nConverting genes to proteins...")
-  for (i in seq_along(index_de$gene_hit_path)) {
-    cat(sprintf(
-      "\nProcessing gene hit %d of %d\n",
-      i,
-      length(index_de$gene_hit_path)
-    ))
-    
-    gene_hit_path <- index_de$gene_hit_path[i]
-    gff_file_path <- index_de$gff_file_path[i]
-    genome_file_path <- index_de$genome_file_path[i]
-    
-    # Clean output_dir from paths for consistency
-    gff_file_path <- sub(
-      pattern = paste0("^", output_dir, "[/\\]"),
-      replacement = "",
-      gff_file_path
-    )
-    genome_file_path <- sub(
-      pattern = paste0("^", output_dir, "[/\\]"),
-      replacement = "",
-      genome_file_path
-    )
-    
-    # Read and process gene hit information
-    gene_hit_file_path_df <- read_csv(file = gene_hit_path, show_col_types = FALSE)
-    transcript_id_raw <- gene_hit_file_path_df$gname
-    transcript_ids <- unique(stri_extract_first(transcript_id_raw, regex = "(?<=ID=)[^;]+"))
-    
-    # Process each transcript
-    for (transcript_id in transcript_ids) {
-      message(sprintf("Processing transcript: %s", transcript_id))
-      
-      tryCatch({
-        protein_out_path <- gene_seq_to_prot(
-          genome_file = genome_file_path,
-          gff_file = gff_file_path,
-          transcript_id = transcript_id,
-          output_dir = output_dir,
-          gene_hit_path = gene_hit_path
-        )
-        
-        # Record successful protein generation
-        gene_to_prot_index <- rbind(
-          gene_to_prot_index,
-          data.frame(
-            gene_hit_path = gene_hit_path,
-            transcript_id = transcript_id,
-            protein_out_path = protein_out_path
-          )
-        )
-      }, error = function(e) {
-        warning(sprintf(
-          "Error processing transcript %s: %s",
-          transcript_id,
-          e$message
-        ))
-      })
-    }
-  }
-  
-  # Update final index with protein information
-  message("\nUpdating final index with protein information...")
-  tryCatch({
-    index_de <- index_de |>
-      full_join(gene_to_prot_index, by = "gene_hit_path")
-  }, error = function(e) {
-    warning(sprintf("Error joining protein information: %s", e$message))
-  })
-  
-  # Save complete index
-  message("\nSaving final index...")
-  write_csv(index_de, file = file.path(output_dir, "final_index.csv"))
-  
-  # Perform homology verification
-  message("\nPerforming homology verification...")
-  tryCatch({
-    results <- verify_tomato_potato_homology(
+    translations <- translate_blast_hits(
+      blast_hit_file = blast_hit_file,
+      genome_file = genome_file,
       output_dir = output_dir,
-      tomato_proteom = tomato_proteom,
-      potato_prot = protein_output_dir_path,
-      tomato_prot = query_dir,
-      evalue = evalue,
-      index_de = index_de
+      extend_bp = extend_bp
     )
     
-    message("\nHomology verification completed successfully")
-    return(results)
+    if (nrow(translations) > 0) {
+      # Add source file information
+      translations$blast_hit_file <- blast_hit_file
+      translations$genome_file <- genome_file
+      translations$query_file <- query_file
+      
+      all_translations <- rbind(all_translations, translations)
+    }
+  }
+  
+  # Save all translation results
+  write_csv(all_translations, file.path(output_dir, "all_translations_index.csv"))
+  
+  # Step 3: Sequence Analysis - Alignment
+  if (run_alignment && nrow(all_translations) > 0) {
+    message("Step 3a: Aligning translated proteins with query sequences...")
     
-  }, error = function(e) {
-    warning(sprintf("Error in homology verification: %s", e$message))
-    return(NULL)
-  })
+    # Initialize columns for alignment results
+    all_translations$alignment_file <- NA
+    
+    # Process each translation
+    for (i in 1:nrow(all_translations)) {
+      protein_file <- all_translations$protein_file[i]
+      query_file <- all_translations$query_file[i]
+      
+      if (i %% 10 == 0 || i == 1 || i == nrow(all_translations)) {
+        message(paste0("Aligning sequence ", i, " of ", nrow(all_translations)))
+      }
+      
+      # Run alignment
+      alignment_file <- align_sequences(
+        protein_file = protein_file,
+        query_file = query_file,
+        output_dir = output_dir
+      )
+      
+      # Update data frame
+      all_translations$alignment_file[i] <- alignment_file
+    }
+    
+    # Save updated translations index
+    write_csv(all_translations, file.path(output_dir, "all_translations_index.csv"))
+  }
+  
+  # Step 4: Sequence Analysis - Domain Identification
+  if (run_domain_search && nrow(all_translations) > 0) {
+    if (is.null(hmm_db) || !file.exists(hmm_db)) {
+      warning("HMMER database not found. Skipping domain identification.")
+    } else {
+      message("Step 3b: Identifying protein domains...")
+      
+      # Initialize columns for domain results
+      all_translations$domain_file <- NA
+      all_domains <- data.frame()
+      
+      # Process each translation
+      for (i in 1:nrow(all_translations)) {
+        protein_file <- all_translations$protein_file[i]
+        
+        if (i %% 10 == 0 || i == 1 || i == nrow(all_translations)) {
+          message(paste0("Searching domains in sequence ", i, " of ", nrow(all_translations)))
+        }
+        
+        # Run domain search
+        domain_file <- identify_domains(
+          protein_file = protein_file,
+          hmm_db = hmm_db,
+          output_dir = output_dir,
+          evalue = 1e-3
+        )
+        
+        # Update data frame
+        all_translations$domain_file[i] <- domain_file
+        
+        # Parse domain results
+        domains <- parse_domain_file(domain_file)
+        if (nrow(domains) > 0) {
+          domains$protein_file <- protein_file
+          domains$hit_id <- all_translations$hit_id[i]
+          domains$query_id <- all_translations$query_id[i]
+          all_domains <- rbind(all_domains, domains)
+        }
+      }
+      
+      # Save domain results
+      if (nrow(all_domains) > 0) {
+        write_csv(all_domains, file.path(output_dir, "domain_results.csv"))
+        
+        # Generate domain summary
+        domain_summary <- all_domains %>%
+          group_by(query_id, target_name) %>%
+          summarize(
+            count = n(),
+            avg_score = mean(score),
+            min_e_value = min(e_value)
+          )
+        
+        write_csv(domain_summary, file.path(output_dir, "domain_summary.csv"))
+      }
+      
+      # Save updated translations index
+      write_csv(all_translations, file.path(output_dir, "all_translations_index.csv"))
+    }
+  }
+  
+  # Generate summary statistics
+  if (nrow(all_translations) > 0) {
+    summary_stats <- all_translations %>%
+      group_by(query_id) %>%
+      summarize(
+        total_hits = n(),
+        avg_length = mean(aa_length),
+        min_length = min(aa_length),
+        max_length = max(aa_length),
+        avg_identity = mean(percent_identity)
+      )
+    
+    # Save summary statistics
+    write_csv(summary_stats, file.path(output_dir, "translation_summary_stats.csv"))
+    
+    # Print summary
+    message("\nSummary of results:")
+    message(paste0("Total translated protein sequences: ", nrow(all_translations)))
+    message(paste0("Number of queries with hits: ", length(unique(all_translations$query_id))))
+    message(paste0("Number of genomes with hits: ", length(unique(all_translations$genome_file))))
+    
+    if (exists("all_domains") && nrow(all_domains) > 0) {
+      message(paste0("Number of domains identified: ", nrow(all_domains)))
+      message(paste0("Number of unique domain types: ", length(unique(all_domains$target_name))))
+    }
+  } else {
+    message("\nNo BLAST hits were found or translated.")
+  }
+  
+  # Return all results
+  results <- list(
+    blast_index = blast_index,
+    translations = all_translations
+  )
+  
+  if (exists("all_domains") && nrow(all_domains) > 0) {
+    results$domains <- all_domains
+  }
+  
+  return(results)
 }
 
+# -- Example Usage ------------------------------------------------------------------
 
-# call main func ----------------------------------------------------------
-# example
-# add index from file as an parameter
+# Example command to run the analysis:
 results <- main(
-  genome_dir = "genomes/new_genomes",
-  query_dir = "meiotic_genes_protein_fasta/test_meiotic_prot", 
-  gff_dir = "gff_files",
-  output_dir = "out_2024_02_24",
+  genome_dir = "genomes/test_genomes",
+  query_dir = "meiotic_genes_protein_fasta/test_meiotic_prot",
+  output_dir = "out_2025_02_26v3",
   evalue = 1e-5,
-  min_seq_len = 50000,
-  tomato_proteom = "tomato/UP000004994_4081.fasta"
+  extend_bp = 300,
+  hmm_db = "pfam_db/Pfam-A.hmm"
 )
-
