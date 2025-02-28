@@ -399,9 +399,10 @@ gene_seq_to_prot <- function(genome_file,
 #' @param query_file Path to the original query protein file
 #' @param output_dir Directory for output files
 #' @return Path to the alignment file
-align_sequences <- function(protein_file, 
-                            query_file,
-                            output_dir) {
+align_multiple_sequences <- function(reference_file, 
+                                     comparison_file1, 
+                                     comparison_file2,
+                                     output_dir) {
   
   # Create directory for alignments
   align_dir <- file.path(output_dir, "sequence_alignments")
@@ -410,48 +411,37 @@ align_sequences <- function(protein_file,
   }
   
   # Generate descriptive output file name
-  protein_basename <- tools::file_path_sans_ext(basename(protein_file))
-  query_basename <- tools::file_path_sans_ext(basename(query_file))
+  reference_basename <- tools::file_path_sans_ext(basename(reference_file))
+  comp1_basename <- tools::file_path_sans_ext(basename(comparison_file1))
+  comp2_basename <- tools::file_path_sans_ext(basename(comparison_file2))
   
-  alignment_name <- paste0(protein_basename, "_vs_", query_basename, ".aln")
+  alignment_name <- paste0(reference_basename, "_vs_", comp1_basename, "_vs_", comp2_basename, ".aln")
   alignment_file <- file.path(align_dir, alignment_name)
   
-  message("Aligning sequences: ", protein_basename, " vs ", query_basename)
+  message("Aligning sequences: ", reference_basename, " with ", comp1_basename, " and ", comp2_basename)
   
   # Read sequences
   tryCatch({
-    protein_seq <- readAAStringSet(protein_file)
-    query_seq <- readAAStringSet(query_file)
+    reference_seq <- readAAStringSet(reference_file)
+    comp1_seq <- readAAStringSet(comparison_file1)
+    comp2_seq <- readAAStringSet(comparison_file2)
     
-    # If there are multiple sequences in the query file, find the right one
-    if (length(query_seq) > 1) {
-      # Extract query ID from protein file header
-      protein_header <- names(protein_seq)[1]
-      query_id_match <- str_extract(protein_header, "Query:[^\\s|]+")
-      if (!is.na(query_id_match)) {
-        query_id <- gsub("Query:", "", query_id_match)
-        # Find the matching query sequence
-        matching_indices <- grep(query_id, names(query_seq))
-        if (length(matching_indices) > 0) {
-          query_seq <- query_seq[matching_indices[1]]
-        } else {
-          # If no match found, just use the first query sequence
-          query_seq <- query_seq[1]
-        }
-      } else {
-        # If no query ID found in header, use the first query sequence
-        query_seq <- query_seq[1]
-      }
-    }
+    # For simplicity, we'll use just the first sequence from each file
+    # If you need specific sequence selection logic, you can adapt that part from the original function
+    if (length(reference_seq) > 1) reference_seq <- reference_seq[1]
+    if (length(comp1_seq) > 1) comp1_seq <- comp1_seq[1]
+    if (length(comp2_seq) > 1) comp2_seq <- comp2_seq[1]
     
     # Add descriptions for clarity
-    names(protein_seq) <- paste0(names(protein_seq), " [TRANSLATED]")
-    names(query_seq) <- paste0(names(query_seq), " [QUERY]")
+    names(reference_seq) <- paste0(names(reference_seq), " [REFERENCE]")
+    names(comp1_seq) <- paste0(names(comp1_seq), " [COMPARISON1]")
+    names(comp2_seq) <- paste0(names(comp2_seq), " [COMPARISON2]")
     
     # Combine sequences
-    combined_seqs <- c(query_seq, protein_seq)
+    combined_seqs <- c(reference_seq, comp1_seq, comp2_seq)
     
     # Perform alignment using MUSCLE algorithm
+    library(msa)
     alignment <- msa(combined_seqs, method = "Muscle")
     
     # Write alignment as FASTA file
@@ -463,7 +453,7 @@ align_sequences <- function(protein_file,
     
     # Check if alignment file was created successfully
     if (!file.exists(alignment_file) || file.size(alignment_file) == 0) {
-      warning("Alignment failed for ", basename(protein_file))
+      warning("Alignment failed for multiple sequences")
       return(NA)
     }
     
@@ -475,6 +465,7 @@ align_sequences <- function(protein_file,
     return(NA)
   })
 }
+
 
 # Main Pipeline Function --------------------------------------------------
 
@@ -494,7 +485,8 @@ run_problaster_pipeline <- function(genome_dir,
                                     gff_dir,
                                     output_dir,
                                     evalue = 1e-5,
-                                    generate_alignments = TRUE) {
+                                    generate_alignments = TRUE,
+                                    reference_file) {
   
   # Initialize error logging
   setup_error_logging()
@@ -773,10 +765,6 @@ run_problaster_pipeline <- function(genome_dir,
   write_csv(final_results, file = final_mapping_file)
   message("Complete pipeline results saved to: ", final_mapping_file)
   
-  browser()
-  #######
-  
-  #######
   # Step 4: Generate sequence alignments (if requested)
   if (generate_alignments && nrow(protein_generation_results) > 0) {
     message("\n== STEP 4: Generating sequence alignments ==")
@@ -799,11 +787,11 @@ run_problaster_pipeline <- function(genome_dir,
         message("  Aligning: ", basename(protein_file), " with ", basename(query_file))
         
         # Generate the alignment
-        alignment_file <- align_sequences(
-          protein_file = protein_file,
-          query_file = query_file,
-          output_dir = output_dir
-        )
+        alignment_file <- align_multiple_sequences(reference_file = reference_file, 
+                                 comparison_file1 = protein_file,
+                                 comparison_file2 = query_file,
+                                 output_dir = output_dir)
+        
         
         # Record alignment result
         if (!is.na(alignment_file)) {
@@ -932,8 +920,9 @@ if (T) {  # Set to TRUE to execute when sourcing this file
     genome_dir = "genomes/test_genomes",
     query_dir = "meiotic_genes_protein_fasta/test_meiotic_prot", 
     gff_dir = "gff_files",
-    output_dir = "out_2025_02_28v7_SPO11_O_hap1",
+    output_dir = "out_2025_02_28v8_SPO11_O_hap1_w_A_tha_aln",
     evalue = 1e-5,
-    generate_alignments = TRUE
+    generate_alignments = TRUE,
+    reference_file = "A_tha/A_tha_SPO11_1.fasta"
   )
 }
