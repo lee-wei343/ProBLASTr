@@ -11,8 +11,8 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# Version: 1.1
-# Last Updated: 2025-02-28
+# Version: 1.2
+# Last Updated: 2025-03-04
 #
 # Contact Information:
 # Lee Weinand
@@ -137,7 +137,7 @@ create_blastdb_and_run_tblastn <- function(genome_dir,
       )
     )
     
-    # Store the database path
+    # Store the database path for indexing
     db_paths[i] <- db_name
   }
   
@@ -158,7 +158,7 @@ create_blastdb_and_run_tblastn <- function(genome_dir,
     stringsAsFactors = FALSE
   )
   
-  # Run BLAST for each query against each database
+  # Run tBLASTn for each query against each database
   for (query in query_files) {
     query_name <- tools::file_path_sans_ext(basename(query))
     message("  Processing query: ", query_name)
@@ -252,7 +252,7 @@ find_gene_from_blast_hit <- function(blast_hit, gff_file) {
     }
   }
   
-  # Only perform the join if we found matching GFF entries
+  # Only perform the join if matching GFF entries were found
   if (nrow(df) > 0) {
     result <- inner_join(blast_hit, df, 
                          by = "sseqid", 
@@ -280,7 +280,8 @@ gene_seq_to_prot <- function(genome_file,
                              gff_file,
                              transcript_id,
                              output_dir,
-                             gene_hit_path) {
+                             gene_hit_path,
+                             seqid = NULL) {
   message("Processing gene to protein conversion for transcript: ", transcript_id)
   
   # Read and filter GFF file to get CDS regions
@@ -359,12 +360,15 @@ gene_seq_to_prot <- function(genome_file,
     " | Reference: ",
     basename(gene_hit_path)
   )
-  
+  if (!is.null(seqid)) {
+    protein_header <- paste0(
+      protein_header, " | seqid: ", seqid
+    )
+  }
   protein_out_path <- file.path(
     protein_output_dir_path,
     paste0(gene_name, "_", genome_name, "_protein.fasta")
   )
-  
   writeLines(c(protein_header, protein), protein_out_path)
   
   # Write transcript sequence file
@@ -377,12 +381,15 @@ gene_seq_to_prot <- function(genome_file,
     basename(gene_hit_path),
     " | CDS Transcript"
   )
-  
+  if (!is.null(seqid)) {
+    transcript_header <- paste0(
+      protein_header, " | seqid: ", seqid
+    )
+  }
   transcript_out_path <- file.path(
     transcript_output_dir_path,
     paste0(gene_name, "_", genome_name, "_transcript.fasta")
   )
-  
   writeLines(
     c(transcript_header, as.character(full_transcript)),
     transcript_out_path
@@ -393,56 +400,57 @@ gene_seq_to_prot <- function(genome_file,
 }
 
 # Sequence Alignment Function ---------------------------------------------
-#' Align translated protein sequences with original query sequences
+#' Align multiple protein sequences from different genomes with the query sequence
 #'
-#' @param protein_file Path to the translated protein sequence file
 #' @param query_file Path to the original query protein file
+#' @param protein_files Vector of paths to the translated protein sequences from different genomes
 #' @param output_dir Directory for output files
+#' @param query_name Name of the query for file naming
 #' @return Path to the alignment file
-align_multiple_sequences <- function(reference_file, 
-                                     comparison_file1, 
-                                     comparison_file2,
-                                     output_dir) {
+align_multiple_sequences <- function(query_file, 
+                                       protein_files, 
+                                       output_dir,
+                                       query_name) {
   
   # Create directory for alignments
-  align_dir <- file.path(output_dir, "sequence_alignments")
+  align_dir <- file.path(output_dir, "multiple_alignments")
   if (!dir.exists(align_dir)) {
     dir.create(align_dir, recursive = TRUE)
   }
   
   # Generate descriptive output file name
-  reference_basename <- tools::file_path_sans_ext(basename(reference_file))
-  comp1_basename <- tools::file_path_sans_ext(basename(comparison_file1))
-  comp2_basename <- tools::file_path_sans_ext(basename(comparison_file2))
-  
-  alignment_name <- paste0(reference_basename, "_vs_", comp1_basename, "_vs_", comp2_basename, ".aln")
+  alignment_name <- paste0(query_name, "_multiple_alignment.aln")
   alignment_file <- file.path(align_dir, alignment_name)
   
-  message("Aligning sequences: ", reference_basename, " with ", comp1_basename, " and ", comp2_basename)
+  message("Creating multiple sequence alignment for query: ", query_name)
+  message("  Including ", length(protein_files), " sequences from different genomes")
   
   # Read sequences
   tryCatch({
-    reference_seq <- readAAStringSet(reference_file)
-    comp1_seq <- readAAStringSet(comparison_file1)
-    comp2_seq <- readAAStringSet(comparison_file2)
+    # Read query sequence
+    query_seq <- readAAStringSet(query_file)
+    if (length(query_seq) > 1) {
+      # If multiple sequences in the query file, just use the first one
+      query_seq <- query_seq[1]
+    }
     
-    # For simplicity, we'll use just the first sequence from each file
-    # If you need specific sequence selection logic, you can adapt that part from the original function
-    if (length(reference_seq) > 1) reference_seq <- reference_seq[1]
-    if (length(comp1_seq) > 1) comp1_seq <- comp1_seq[1]
-    if (length(comp2_seq) > 1) comp2_seq <- comp2_seq[1]
+    # Read all protein sequences
+    all_seqs <- query_seq
+    for (protein_file in protein_files) {
+      if (file.exists(protein_file)) {
+        protein_seq <- readAAStringSet(protein_file)
+        # Add genome identifier from filename to make sequence names unique
+        genome_id <- sub(".*_(.*?)_protein\\.fasta$", "\\1", basename(protein_file))
+        names(protein_seq) <- paste0(names(protein_seq), " [", genome_id, "]")
+        all_seqs <- c(all_seqs, protein_seq)
+      }
+    }
     
-    # Add descriptions for clarity
-    names(reference_seq) <- paste0(names(reference_seq), " [REFERENCE]")
-    names(comp1_seq) <- paste0(names(comp1_seq), " [COMPARISON1]")
-    names(comp2_seq) <- paste0(names(comp2_seq), " [COMPARISON2]")
-    
-    # Combine sequences
-    combined_seqs <- c(reference_seq, comp1_seq, comp2_seq)
+    # Rename query sequence for clarity
+    names(all_seqs)[1] <- paste0(names(all_seqs)[1], " [QUERY]")
     
     # Perform alignment using MUSCLE algorithm
-    library(msa)
-    alignment <- msa(combined_seqs, method = "Muscle")
+    alignment <- msa(all_seqs, method = "Muscle")
     
     # Write alignment as FASTA file
     writeXStringSet(
@@ -451,24 +459,17 @@ align_multiple_sequences <- function(reference_file,
       format = "fasta"
     )
     
-    # Check if alignment file was created successfully
-    if (!file.exists(alignment_file) || file.size(alignment_file) == 0) {
-      warning("Alignment failed for multiple sequences")
-      return(NA)
-    }
-    
-    message("Alignment completed: ", basename(alignment_file))
+    message("  Alignment completed: ", basename(alignment_file))
     return(alignment_file)
     
   }, error = function(e) {
-    warning("Error performing alignment: ", e$message)
+    warning("Error performing multiple sequence alignment: ", e$message)
     return(NA)
   })
 }
 
 
 # Main Pipeline Function --------------------------------------------------
-
 #' Main execution function for ProBLASTr pipeline
 #'
 #' Runs the entire workflow from BLAST searches through protein sequence generation
@@ -480,6 +481,7 @@ align_multiple_sequences <- function(reference_file,
 #' @param evalue E-value threshold for BLAST searches (default: 1e-5)
 #' @param generate_alignments Whether to generate sequence alignments (default: TRUE)
 #' @return Data frame with complete pipeline results
+# Main Pipeline Function - modified to track qseqid values
 run_problaster_pipeline <- function(genome_dir,
                                     query_dir,
                                     gff_dir,
@@ -552,7 +554,7 @@ run_problaster_pipeline <- function(genome_dir,
   )
   
   # Step 1: Run BLAST searches
-  message("\n== STEP 1: Running BLAST searches ==")
+  message("\n== STEP 1: Running tBLASTn searches ==")
   blast_results <- create_blastdb_and_run_tblastn(
     genome_dir = genome_dir, 
     query_dir = query_dir, 
@@ -561,7 +563,7 @@ run_problaster_pipeline <- function(genome_dir,
   )
   
   # Step 2: Process BLAST hits to find corresponding genes
-  message("\n== STEP 2: Finding genes corresponding to BLAST hits ==")
+  message("\n== STEP 2: Finding genes corresponding to tBLASTn hits ==")
   
   # Create directory for gene hits
   gene_hit_dir_path <- file.path(output_dir, "gene_matches")
@@ -604,7 +606,8 @@ run_problaster_pipeline <- function(genome_dir,
         "qstart", "qend", "sstart", "send", "evalue", "bitscore"
       )
     ) |>
-      mutate(sseqid = as.character(sseqid))
+      mutate(sseqid = as.character(sseqid),
+             qseqid = as.character(qseqid))  # Ensure qseqid is character type
     
     # Find corresponding GFF file
     gff_file_path <- genome_name_to_gff[target_genome]
@@ -681,17 +684,20 @@ run_problaster_pipeline <- function(genome_dir,
     # remove target_genome, so it won't appear twice in the next join
     dplyr::select(-target_genome)
   
-  # Also add query information
+  # Add query information
   pipeline_results <- left_join(pipeline_results,
                                 blast_results,
                                 by = "blast_hit_file_path")
-  
   
   # Initialize data frame to track protein generation
   protein_generation_results <- data.frame(
     gene_match_file_path = character(0),
     transcript_id = character(0),
     protein_sequence_path = character(0),
+    qseqid = character(0),  # Query sequence ID
+    seqid = character(0),   # Added column to store seqid (subject sequence ID)
+    gstart = character(0),
+    gend = character(0),
     stringsAsFactors = FALSE
   )
   
@@ -708,17 +714,30 @@ run_problaster_pipeline <- function(genome_dir,
     # Read gene match data
     gene_match_data <- read_csv(gene_match_path, show_col_types = FALSE)
     
-    # Extract transcript IDs
-    transcript_id_raw <- gene_match_data$gname
-    transcript_ids <- unique(stri_extract_first(transcript_id_raw, regex = "(?<=ID=)[^;]+"))
+    # Extract transcript IDs and their corresponding qseqid's and seqid's from column gname
+    transcript_info <- gene_match_data %>%
+      group_by(gname) %>%
+      summarize(
+        transcript_id = stri_extract_first(gname[1], regex = "(?<=ID=)[^;]+"),
+        qseqid = qseqid[1],  # Extract the first Qery Sequence ID
+        seqid = sseqid[1],    # Extract the first Subject Sequence ID 
+        gstart = gstart[1],  # added
+        gend = gend[1]  # added
+      ) %>%
+      filter(!is.na(transcript_id))
     
-    message("    Found ", length(transcript_ids), " unique transcript(s) to process")
-    
-    
+    message("    Found ", nrow(transcript_info), " unique transcript(s) to process")
     
     # Process each transcript
-    for (transcript_id in transcript_ids) {
-      message("    Processing transcript: ", transcript_id)
+    for (j in seq_len(nrow(transcript_info))) {
+      transcript_id <- transcript_info$transcript_id[j]
+      current_qseqid <- transcript_info$qseqid[j]
+      current_seqid <- transcript_info$seqid[j]  # Get seqid
+      current_gstart <- transcript_info$gstart[j]
+      current_gend <- transcript_info$gend[j]
+      
+      message("    Processing transcript: ", transcript_id, 
+              " (qseqid: ", current_qseqid, ", seqid: ", current_seqid, ")")
       
       tryCatch({
         # Extract and translate sequence
@@ -727,16 +746,21 @@ run_problaster_pipeline <- function(genome_dir,
           gff_file = gff_file_path,
           transcript_id = transcript_id,
           output_dir = output_dir,
-          gene_hit_path = gene_match_path
+          gene_hit_path = gene_match_path,
+          seqid = current_seqid
         )
         
-        # Record protein generation result
+        # Record protein generation result with qseqid, seqid, gstart and gend
         protein_generation_results <- rbind(
           protein_generation_results,
           data.frame(
             gene_match_file_path = gene_match_path,
             transcript_id = transcript_id,
             protein_sequence_path = protein_sequence_path,
+            qseqid = current_qseqid,
+            seqid = current_seqid,
+            gstart = current_gstart,
+            gend = current_gend,
             stringsAsFactors = FALSE
           )
         )
@@ -764,68 +788,68 @@ run_problaster_pipeline <- function(genome_dir,
   final_mapping_file <- file.path(output_dir, "problaster_complete_pipeline_results.csv")
   write_csv(final_results, file = final_mapping_file)
   message("Complete pipeline results saved to: ", final_mapping_file)
+  # In the run_problaster_pipeline function, replace the alignment section with:
   
-  # Step 4: Generate sequence alignments (if requested)
+  # Step 4: (Optional) Generate multiple sequence alignments
   if (generate_alignments && nrow(protein_generation_results) > 0) {
-    message("\n== STEP 4: Generating sequence alignments ==")
+    message("\n== STEP 4: Generating multiple sequence alignments ==")
     
     alignment_results <- data.frame(
-      protein_sequence_path = character(0),
+      query_name = character(0),
       query_path = character(0),
       alignment_file_path = character(0),
+      num_sequences = integer(0),
       stringsAsFactors = FALSE
     )
     
-    # Match each protein sequence with its original query
-    for (i in seq_len(nrow(final_results))) {
-      if (!is.na(final_results$protein_sequence_path[i]) && 
-          !is.na(final_results$query_path[i])) {
-        
-        protein_file <- final_results$protein_sequence_path[i]
-        query_file <- final_results$query_path[i]
-        
-        message("  Aligning: ", basename(protein_file), " with ", basename(query_file))
-        
-        # Generate the alignment
-        alignment_file <- align_multiple_sequences(reference_file = reference_file, 
-                                 comparison_file1 = protein_file,
-                                 comparison_file2 = query_file,
-                                 output_dir = output_dir)
-        
-        
-        # Record alignment result
-        if (!is.na(alignment_file)) {
-          alignment_results <- rbind(
-            alignment_results,
-            data.frame(
-              protein_sequence_path = protein_file,
-              query_path = query_file,
-              alignment_file_path = alignment_file,
-              stringsAsFactors = FALSE
-            )
+    # Group protein sequences by query
+    protein_by_query <- final_results %>%
+      filter(!is.na(protein_sequence_path)) %>%
+      group_by(query_name, query_path) %>%
+      summarise(
+        protein_files = list(protein_sequence_path),
+        num_sequences = n(),
+        .groups = "drop"
+      )
+    
+    # Create multiple sequence alignment for each query
+    for (i in seq_len(nrow(protein_by_query))) {
+      query_name <- protein_by_query$query_name[i]
+      query_path <- protein_by_query$query_path[i]
+      protein_files <- unlist(protein_by_query$protein_files[i])
+      
+      message("Creating multiple alignment for query: ", query_name)
+      message("  Including ", length(protein_files), " sequences from different genomes")
+      
+      alignment_file <- align_multiple_sequences(
+        query_file = query_path,
+        protein_files = protein_files,
+        output_dir = output_dir,
+        query_name = query_name
+      )
+      
+      # Record alignment result
+      if (!is.na(alignment_file)) {
+        alignment_results <- rbind(
+          alignment_results,
+          data.frame(
+            query_name = query_name,
+            query_path = query_path,
+            alignment_file_path = alignment_file,
+            num_sequences = length(protein_files),
+            stringsAsFactors = FALSE
           )
-        }
+        )
       }
     }
     
     # Save alignment results
     if (nrow(alignment_results) > 0) {
-      alignment_mapping_file <- file.path(output_dir, "sequence_alignment_mapping.csv")
+      alignment_mapping_file <- file.path(output_dir, "multiple_alignment_mapping.csv")
       write_csv(alignment_results, file = alignment_mapping_file)
-      message("Sequence alignment results saved to: ", alignment_mapping_file)
-      
-      # Add alignment information to final results
-      final_results <- final_results |>
-        left_join(
-          alignment_results |> 
-            dplyr::select(protein_sequence_path, alignment_file_path),
-          by = "protein_sequence_path"
-        )
-      
-      # Update the complete results file
-      write_csv(final_results, file = final_mapping_file)
+      message("Multiple sequence alignment results saved to: ", alignment_mapping_file)
     } else {
-      message("No alignments were generated.")
+      message("No multiple sequence alignments were generated.")
     }
   }
   
@@ -883,46 +907,47 @@ filter_gene_hits <- function(blast_hits, max_distance = 10000, min_bitscore = 30
   filtered_hits <- blast_hits |>
     filter(bitscore >= min_bitscore)
   
-  if (nrow(filtered_hits) == 0) {
-    return(filtered_hits)
-  }
+  # if (nrow(filtered_hits) == 0) {
+  #   return(filtered_hits)
+  # }
+  return(filtered_hits)
   
-  # Group by sequence ID and order by position
-  ordered_hits <- filtered_hits |>
-    group_by(sseqid) |>
-    arrange(sseqid, pmin(sstart, send)) |>
-    mutate(
-      hit_start = pmin(sstart, send),
-      hit_end = pmax(sstart, send)
-    )
+  # modify the following part: don't arrange by pmin and cluster
   
-  # Identify clusters of hits that are close to each other
-  clustered_hits <- ordered_hits |>
-    mutate(
-      cluster = cumsum(c(1, diff(hit_start) > max_distance))
-    )
-  
-  # Get the best hit from each cluster
-  best_hits <- clustered_hits |>
-    group_by(sseqid, cluster) |>
-    slice_max(order_by = bitscore, n = 1) |>
-    ungroup() |>
-    dplyr::select(-cluster)
-  
-  return(best_hits)
+  # 
+  # # Group by sequence ID and order by position
+  # ordered_hits <- filtered_hits |>
+  #   group_by(sseqid) |>
+  #   arrange(sseqid, pmin(sstart, send)) |>
+  #   mutate(
+  #     hit_start = pmin(sstart, send),
+  #     hit_end = pmax(sstart, send)
+  #   )
+  # 
+  # # Identify clusters of hits that are close to each other
+  # clustered_hits <- ordered_hits |>
+  #   mutate(
+  #     cluster = cumsum(c(1, diff(hit_start) > max_distance))
+  #   )
+  # 
+  # # Get the best hit from each cluster
+  # best_hits <- clustered_hits |>
+  #   group_by(sseqid, cluster) |>
+  #   slice_max(order_by = bitscore, n = 1) |>
+  #   ungroup() |>
+  #   dplyr::select(-cluster)
+  # 
+  # return(best_hits)
 }
-
 
 # Example call ------------------------------------------------------------
 # Example of how to run the complete pipeline
 if (T) {  # Set to TRUE to execute when sourcing this file
   results <- run_problaster_pipeline(
-    genome_dir = "genomes/test_genomes",
+    genome_dir = "genomes/new_genomes",
     query_dir = "meiotic_genes_protein_fasta/test_meiotic_prot", 
     gff_dir = "gff_files",
-    output_dir = "out_2025_02_28v8_SPO11_O_hap1_w_A_tha_aln",
+    output_dir = "out_2025_03_04_SPO11_all_gene",
     evalue = 1e-5,
-    generate_alignments = TRUE,
-    reference_file = "A_tha/A_tha_SPO11_1.fasta"
-  )
-}
+    generate_alignments = T,
+    reference_file = "A_tha/A_tha_SPO11_1.fasta")}
