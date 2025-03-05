@@ -4,7 +4,7 @@
 # Description: A pipeline for protein BLAST analysis to identify homologous genes
 #              across genomic datasets
 #
-# Copyright (C) [2025] [University of Cologne]
+# Copyright (C) [2025] 
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -12,11 +12,10 @@
 # (at your option) any later version.
 #
 # Version: 1.2
-# Last Updated: 2025-03-04
+# Last Updated: 2025-03-05
 #
-# Contact Information:
+# Author:
 # Lee Weinand
-# University of Cologne
 #
 # Dependencies:
 # R version 4.4.1 or higher
@@ -35,12 +34,13 @@ suppressPackageStartupMessages({
   library(Rsamtools)
   library(stringi)
   library(msa)
+  library(pwalign)
 })
 
 check_dependencies <- function() {
   required_packages <- c(
     "tidyverse", "GenomicRanges", "Biostrings", "GenomicFeatures",
-    "rtracklayer", "Rsamtools", "stringi", "msa"
+    "rtracklayer", "Rsamtools", "stringi", "msa", "pwalign"
   )
   
   missing_packages <- required_packages[!requireNamespace(required_packages, quietly = TRUE)]
@@ -56,7 +56,7 @@ check_dependencies <- function() {
 
 # Global Config -----------------------------------------------------------
 # Set up error logging
-setup_error_logging <- function() {
+setup_logging <- function() {
   log_file <- "problaster_error_log.txt"
   
   error_handler <- function() {
@@ -383,7 +383,7 @@ gene_seq_to_prot <- function(genome_file,
   )
   if (!is.null(seqid)) {
     transcript_header <- paste0(
-      protein_header, " | seqid: ", seqid
+      transcript_header, " | seqid: ", seqid
     )
   }
   transcript_out_path <- file.path(
@@ -399,7 +399,94 @@ gene_seq_to_prot <- function(genome_file,
   return(protein_out_path)
 }
 
-# Sequence Alignment Function ---------------------------------------------
+# Sequence Alignment Functions ---------------------------------------------
+#' Pairwise align the query protein sequence against the subject protein sequence and 
+#' score the percentage identity and the BLOSUM65 score
+pairwise_align_protein_sequences_and_score <- function(query_file,
+                                                       protein_files,
+                                                       output_dir,
+                                                       query_name,
+                                                       gap_opening = -10,
+                                                       gap_extension = -0.5) {
+  # Create directory for alignments
+  align_dir <- file.path(output_dir, "pairwise_alignments")
+  if (!dir.exists(align_dir)) {
+    dir.create(align_dir, recursive = TRUE)
+  }
+  
+  # Generate descriptive output file name
+  alignment_name <- paste0(query_name, "_pairwise_alignment.aln")
+  alignment_file <- file.path(align_dir, alignment_name)
+  
+  message("Creating pairwise sequence alignment for query: ", query_name)
+  message("  Including ",
+          length(protein_files),
+          " sequences from different genomes")
+  
+  # Read sequences
+  tryCatch({
+    # Read query sequence
+    query_seq <- readAAStringSet(query_file)
+    if (length(query_seq) > 1) {
+      # If multiple sequences in the query file, just use the first one
+      query_seq <- query_seq[1]
+    }
+    
+    # Read protein sequence
+    for (protein_file in protein_files) {
+      if (file.exists(protein_file)) {
+        protein_seq <- readAAStringSet(protein_file)
+        # Add genome identifier from filename to make sequence names unique
+        genome_id <- sub(".*_(.*?)_protein\\.fasta$",
+                         "\\1",
+                         basename(protein_file))
+        names(protein_seq) <- paste0(names(protein_seq), " [", genome_id, "]")
+        
+        
+        # Rename query sequence for clarity
+        names(query_seq) <- paste0(names(query_seq), " [QUERY]")
+        
+        # load alignment data
+        data("BLOSUM62")
+        
+        # Pairwise align query and subject protein sequence
+        palign <- pairwiseAlignment(
+          query_seq,
+          protein_seq,
+          substitutionMatrix = BLOSUM62,
+          # Using BLOSUM62 for homologous proteins
+          gapOpening = gap_opening,
+          # Gap opening penalty
+          gapExtension = gap_extension,
+          # Gap extension penalty
+          scoreOnly = FALSE,
+          # Return full alignment, not just score
+          type = "global"
+          # Use global alignment for homologous proteins
+        )
+        
+        # Score alignment
+        score <- score(palign)
+        pid <- pid(palign)
+        
+        # Write alignment as FASTA file
+        writeXStringSet(as(palign, "AAStringSet"),
+                        filepath = alignment_file,
+                        format = "fasta")
+      }
+    }
+    
+    message("  Alignment completed: ", basename(alignment_file))
+    message("    Pairwise alignment score: ", score)
+    message("    Pairwise alignment identity: ", round(pid))
+    return(list(pscore = score, pid = pid))
+    
+  }, error = function(e) {
+    warning("Error performing pairwise sequence alignment: ", e$message)
+    return(NA)
+  })
+}
+
 #' Align multiple protein sequences from different genomes with the query sequence
 #'
 #' @param query_file Path to the original query protein file
@@ -408,9 +495,9 @@ gene_seq_to_prot <- function(genome_file,
 #' @param query_name Name of the query for file naming
 #' @return Path to the alignment file
 align_multiple_sequences <- function(query_file, 
-                                       protein_files, 
-                                       output_dir,
-                                       query_name) {
+                                     protein_files, 
+                                     output_dir,
+                                     query_name) {
   
   # Create directory for alignments
   align_dir <- file.path(output_dir, "multiple_alignments")
@@ -443,21 +530,30 @@ align_multiple_sequences <- function(query_file,
         genome_id <- sub(".*_(.*?)_protein\\.fasta$", "\\1", basename(protein_file))
         names(protein_seq) <- paste0(names(protein_seq), " [", genome_id, "]")
         all_seqs <- c(all_seqs, protein_seq)
+        
+        # Rename query sequence for clarity
+        names(all_seqs)[1] <- paste0(names(all_seqs)[1], " [QUERY]")
+        
+        # Perform alignment using MUSCLE algorithm
+        alignment <- msa(all_seqs, method = "Muscle")
+        
+        # score alignment
+        
+        
+        # Write alignment as FASTA file
+        writeXStringSet(
+          as(alignment, "AAStringSet"),
+          filepath = alignment_file,
+          format = "fasta"
+        )
+        
+        
+        
+        
       }
     }
     
-    # Rename query sequence for clarity
-    names(all_seqs)[1] <- paste0(names(all_seqs)[1], " [QUERY]")
     
-    # Perform alignment using MUSCLE algorithm
-    alignment <- msa(all_seqs, method = "Muscle")
-    
-    # Write alignment as FASTA file
-    writeXStringSet(
-      as(alignment, "AAStringSet"),
-      filepath = alignment_file,
-      format = "fasta"
-    )
     
     message("  Alignment completed: ", basename(alignment_file))
     return(alignment_file)
@@ -488,8 +584,10 @@ run_problaster_pipeline <- function(genome_dir,
                                     output_dir,
                                     evalue = 1e-5,
                                     generate_alignments = TRUE,
+                                    min_score_threshold,
+                                    min_pid_threshold,
                                     reference_file) {
-  
+
   # Initialize error logging
   setup_error_logging()
   
@@ -563,7 +661,7 @@ run_problaster_pipeline <- function(genome_dir,
   )
   
   # Step 2: Process BLAST hits to find corresponding genes
-  message("\n== STEP 2: Finding genes corresponding to tBLASTn hits ==")
+  message("\n== STEP 2: Finding annotated genes corresponding to tBLASTn hits ==")
   
   # Create directory for gene hits
   gene_hit_dir_path <- file.path(output_dir, "gene_matches")
@@ -775,24 +873,12 @@ run_problaster_pipeline <- function(genome_dir,
   write_csv(protein_generation_results, file = protein_mapping_file)
   message("Protein generation results saved to: ", protein_mapping_file)
   
-  # Combine all results into a single comprehensive mapping
-  final_results <- pipeline_results |>
-    left_join(protein_generation_results, by = "gene_match_file_path") |>
-    mutate(
-      query_name = ifelse(is.na(query_name), 
-                          sub("^(.*)_matches_in_.*\\.csv$", "\\1", basename(gene_match_file_path)),
-                          query_name)
-    )
+  # Step 4: Filter sequences based on pairwise alignment score and generate alignments
+  alignment_results <- data.frame()
+  filtered_protein_results <- data.frame()
   
-  # Create a meaningful final mapping file
-  final_mapping_file <- file.path(output_dir, "problaster_complete_pipeline_results.csv")
-  write_csv(final_results, file = final_mapping_file)
-  message("Complete pipeline results saved to: ", final_mapping_file)
-  # In the run_problaster_pipeline function, replace the alignment section with:
-  
-  # Step 4: (Optional) Generate multiple sequence alignments
   if (generate_alignments && nrow(protein_generation_results) > 0) {
-    message("\n== STEP 4: Generating multiple sequence alignments ==")
+    message("\n== STEP 4: Filtering sequences by alignment score and generating alignments ==")
     
     alignment_results <- data.frame(
       query_name = character(0),
@@ -802,8 +888,18 @@ run_problaster_pipeline <- function(genome_dir,
       stringsAsFactors = FALSE
     )
     
+    filtered_protein_results <- data.frame(
+      query_name = character(0),
+      protein_sequence_path = character(0),
+      pscore = numeric(0),
+      pid = numeric(0),
+      passed_filter = logical(0),
+      stringsAsFactors = FALSE
+    )
+    
     # Group protein sequences by query
-    protein_by_query <- final_results %>%
+    protein_by_query <- pipeline_results %>%
+      left_join(protein_generation_results, by = "gene_match_file_path") %>%
       filter(!is.na(protein_sequence_path)) %>%
       group_by(query_name, query_path) %>%
       summarise(
@@ -812,36 +908,138 @@ run_problaster_pipeline <- function(genome_dir,
         .groups = "drop"
       )
     
-    # Create multiple sequence alignment for each query
+    # Assess and filter protein sequences for each query
     for (i in seq_len(nrow(protein_by_query))) {
       query_name <- protein_by_query$query_name[i]
       query_path <- protein_by_query$query_path[i]
       protein_files <- unlist(protein_by_query$protein_files[i])
       
-      message("Creating multiple alignment for query: ", query_name)
-      message("  Including ", length(protein_files), " sequences from different genomes")
+      message("Evaluating and filtering sequences for query: ", query_name)
+      message("  Analyzing ", length(protein_files), " sequences from different genomes")
       
-      alignment_file <- align_multiple_sequences(
-        query_file = query_path,
-        protein_files = protein_files,
-        output_dir = output_dir,
-        query_name = query_name
+      # Score each protein sequence against the query
+      filtered_proteins <- c()
+      scores_data <- data.frame(
+        protein_sequence_path = character(0),
+        pscore = numeric(0),
+        pid = numeric(0),
+        passed_filter = logical(0),
+        stringsAsFactors = FALSE
       )
       
-      # Record alignment result
-      if (!is.na(alignment_file)) {
-        alignment_results <- rbind(
-          alignment_results,
-          data.frame(
-            query_name = query_name,
-            query_path = query_path,
-            alignment_file_path = alignment_file,
-            num_sequences = length(protein_files),
-            stringsAsFactors = FALSE
-          )
+      for (protein_file in protein_files) {
+        message("  Scoring: ", basename(protein_file))
+        
+        # Get alignment score and percent identity
+        alignment_result <- pairwise_align_protein_sequences_and_score(
+          query_file = query_path,
+          protein_files = c(protein_file),
+          output_dir = output_dir,
+          query_name = paste0(query_name, "_", basename(protein_file))
         )
+        
+        # Check if alignment was successful
+        if (!is.na(alignment_result$pscore)) {
+          # Apply filtering criteria
+          passed_filter <- (alignment_result$pscore >= min_score_threshold && 
+                              alignment_result$pid >= min_pid_threshold)
+          
+          # Add to scores data
+          scores_data <- rbind(
+            scores_data,
+            data.frame(
+              protein_sequence_path = protein_file,
+              pscore = alignment_result$pscore,
+              pid = alignment_result$pid,
+              passed_filter = passed_filter,
+              stringsAsFactors = FALSE
+            )
+          )
+          
+          # Create score vs pid scatter plot
+          if (nrow(scores_data) > 0) {
+            plot <- ggplot(data = scores_data,
+                           mapping = aes(x = pscore, y = pid)) +
+              geom_point() +
+              labs(title = paste("Alignment Scores for", query_name),
+                   x = "BLOSUM Score",
+                   y = "Percent Identity")
+            
+            # Create plot directory if it doesn't exist
+            plot_dir <- file.path(output_dir, "alignment_plots")
+            if (!dir.exists(plot_dir)) {
+              dir.create(plot_dir, recursive = TRUE)
+            }
+            
+            # Save plot with more descriptive filename
+            ggsave(
+              filename = paste0(query_name, "_alignment_scores.png"), 
+              plot = plot, 
+              path = plot_dir,
+              width = 8,
+              height = 6
+            )
+          }
+          
+          if (passed_filter) {
+            filtered_proteins <- c(filtered_proteins, protein_file)
+            message("    Passed filter: Score=", round(alignment_result$pscore, 1), 
+                    ", PID=", round(alignment_result$pid, 1), "%")
+          } else {
+            message("    Failed filter: Score=", round(alignment_result$pscore, 1), 
+                    ", PID=", round(alignment_result$pid, 1), "% (below thresholds)")
+          }
+        } else {
+          message("    Alignment failed, excluding from further analysis")
+        }
+      }
+      
+      # Save filtering results for this query
+      filtered_protein_results <- rbind(
+        filtered_protein_results,
+        data.frame(
+          query_name = query_name,
+          scores_data,
+          stringsAsFactors = FALSE
+        )
+      )
+      
+      # Only proceed with multiple sequence alignment if enough sequences passed filtering
+      if (length(filtered_proteins) >= 2) {
+        message("  Proceeding with multiple sequence alignment using ", 
+                length(filtered_proteins), " filtered sequences")
+        
+        # Generate multiple sequence alignment with filtered sequences
+        alignment_file <- align_multiple_sequences(
+          query_file = query_path,
+          protein_files = filtered_proteins,
+          output_dir = output_dir,
+          query_name = paste0(query_name, "_filtered")
+        )
+        
+        # Record alignment result
+        if (!is.na(alignment_file)) {
+          alignment_results <- rbind(
+            alignment_results,
+            data.frame(
+              query_name = query_name,
+              query_path = query_path,
+              alignment_file_path = alignment_file,
+              num_sequences = length(filtered_proteins),
+              stringsAsFactors = FALSE
+            )
+          )
+        }
+      } else {
+        message("  Not enough sequences passed filtering criteria for ", query_name, 
+                ". Need at least 2 sequences for multiple alignment.")
       }
     }
+    
+    # Save filtering results
+    filtering_results_file <- file.path(output_dir, "sequence_filtering_results.csv")
+    write_csv(filtered_protein_results, file = filtering_results_file)
+    message("Sequence filtering results saved to: ", filtering_results_file)
     
     # Save alignment results
     if (nrow(alignment_results) > 0) {
@@ -849,17 +1047,61 @@ run_problaster_pipeline <- function(genome_dir,
       write_csv(alignment_results, file = alignment_mapping_file)
       message("Multiple sequence alignment results saved to: ", alignment_mapping_file)
     } else {
-      message("No multiple sequence alignments were generated.")
+      message("No multiple sequence alignments were generated after filtering.")
     }
   }
   
+  # Combine all results into a single comprehensive mapping - MOVED AFTER STEP 4
+  # Start with basic joining of results
+  intermediate_results <- pipeline_results %>%
+    left_join(protein_generation_results, by = "gene_match_file_path") %>%
+    mutate(
+      query_name = ifelse(is.na(query_name), 
+                          sub("^(.*)_matches_in_.*\\.csv$", "\\1", basename(gene_match_file_path)),
+                          query_name)
+    )
+  
+  # Add filtering information if available
+  if (nrow(filtered_protein_results) > 0) {
+    intermediate_results <- intermediate_results %>%
+      left_join(
+        filtered_protein_results %>% 
+          select(query_name, protein_sequence_path, pscore, pid, passed_filter),
+        by = c("query_name", "protein_sequence_path")
+      )
+    
+    # Filter to keep only hits that passed the threshold
+    final_results <- intermediate_results %>%
+      filter(is.na(passed_filter) | passed_filter == TRUE)
+    
+    message("Filtering final results: kept ", nrow(final_results), 
+            " out of ", nrow(intermediate_results), " hits that passed threshold criteria")
+  } else {
+    # If no filtering was done, use all results
+    final_results <- intermediate_results
+    message("No alignment filtering was performed, including all hits in final results")
+  }
+  
+  # Add alignment information if available
+  if (nrow(alignment_results) > 0) {
+    final_results <- final_results %>%
+      left_join(alignment_results %>% select(query_name, alignment_file_path), by = "query_name")
+  }
+  
+  # Create a meaningful final mapping file
+  final_mapping_file <- file.path(output_dir, "problaster_complete_pipeline_results.csv")
+  write_csv(final_results, file = final_mapping_file)
+  message("Complete pipeline results saved to: ", final_mapping_file)
+  
   # Generate a summary report
   pipeline_summary <- data.frame(
-    stage = c("BLAST searches", "Gene matches", "Protein sequences", "Alignments"),
+    stage = c("BLAST searches", "Gene matches", "Protein sequences", 
+              "Sequences passing filters", "Final alignments"),
     count = c(
       nrow(blast_results),
       nrow(gene_identification_results),
       nrow(protein_generation_results),
+      if(generate_alignments) sum(filtered_protein_results$passed_filter) else NA,
       if(generate_alignments) nrow(alignment_results) else NA
     )
   )
@@ -877,7 +1119,8 @@ run_problaster_pipeline <- function(genome_dir,
   message("Gene matches found: ", pipeline_summary$count[2])
   message("Protein sequences generated: ", pipeline_summary$count[3])
   if (generate_alignments) {
-    message("Sequence alignments created: ", pipeline_summary$count[4])
+    message("Sequences passing alignment filters: ", pipeline_summary$count[4])
+    message("Multiple sequence alignments created: ", pipeline_summary$count[5])
   }
   message("All results saved to: ", output_dir)
   message("Complete pipeline mapping: ", final_mapping_file)
@@ -891,14 +1134,12 @@ run_problaster_pipeline <- function(genome_dir,
 #' Filters gene hits based on position and score 
 #'
 #' This function filters gene hits to identify the most significant matches 
-#' by including only those above a certain bitscore and keeps only one gene
-#' of those which are close together.
+#' by including only those above a certain bitscore.
 #'
 #' @param blast_hits DataFrame containing BLAST hits
-#' @param max_distance Maximum distance between hit regions to be considered separate
 #' @param min_bitscore Minimum bitscore threshold for filtering
 #' @return Filtered DataFrame with the most significant hits
-filter_gene_hits <- function(blast_hits, max_distance = 10000, min_bitscore = 30) {
+filter_gene_hits <- function(blast_hits, min_bitscore = 30) {
   if (nrow(blast_hits) == 0) {
     return(blast_hits)
   }
@@ -907,47 +1148,20 @@ filter_gene_hits <- function(blast_hits, max_distance = 10000, min_bitscore = 30
   filtered_hits <- blast_hits |>
     filter(bitscore >= min_bitscore)
   
-  # if (nrow(filtered_hits) == 0) {
-  #   return(filtered_hits)
-  # }
   return(filtered_hits)
-  
-  # modify the following part: don't arrange by pmin and cluster
-  
-  # 
-  # # Group by sequence ID and order by position
-  # ordered_hits <- filtered_hits |>
-  #   group_by(sseqid) |>
-  #   arrange(sseqid, pmin(sstart, send)) |>
-  #   mutate(
-  #     hit_start = pmin(sstart, send),
-  #     hit_end = pmax(sstart, send)
-  #   )
-  # 
-  # # Identify clusters of hits that are close to each other
-  # clustered_hits <- ordered_hits |>
-  #   mutate(
-  #     cluster = cumsum(c(1, diff(hit_start) > max_distance))
-  #   )
-  # 
-  # # Get the best hit from each cluster
-  # best_hits <- clustered_hits |>
-  #   group_by(sseqid, cluster) |>
-  #   slice_max(order_by = bitscore, n = 1) |>
-  #   ungroup() |>
-  #   dplyr::select(-cluster)
-  # 
-  # return(best_hits)
 }
+
 
 # Example call ------------------------------------------------------------
 # Example of how to run the complete pipeline
 if (T) {  # Set to TRUE to execute when sourcing this file
   results <- run_problaster_pipeline(
-    genome_dir = "genomes/new_genomes",
+    genome_dir = "genomes/test_genomes",
     query_dir = "meiotic_genes_protein_fasta/test_meiotic_prot", 
     gff_dir = "gff_files",
-    output_dir = "out_2025_03_04_SPO11_all_gene",
+    output_dir = "out_2025_03_05_SPO11_test",
     evalue = 1e-5,
     generate_alignments = T,
+    min_score_threshold = 300, # Minimum acceptable BLOSUM score
+    min_pid_threshold = 25, # Minimum percent identity (0-100)
     reference_file = "A_tha/A_tha_SPO11_1.fasta")}
