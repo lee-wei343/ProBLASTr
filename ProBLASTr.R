@@ -11,8 +11,8 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# Version: 1.3
-# Last Updated: 2025-03-05
+# Version: 1.5
+# Last Updated: 2025-03-07
 #
 # Author:
 # Lee Weinand
@@ -36,7 +36,6 @@ suppressPackageStartupMessages({
   library(stringi)
   library(msa)
   library(pwalign)
-  # Additional libraries for tree building
   library(ape)
   library(phangorn)
   library(DECIPHER)
@@ -56,7 +55,6 @@ check_dependencies <- function() {
     "stringi",
     "msa",
     "pwalign",
-    # Additional dependencies for tree building
     "ape",
     "phangorn",
     "DECIPHER",
@@ -443,7 +441,7 @@ pairwise_align_protein_sequences_and_score <- function(query_file,
     dir.create(align_dir, recursive = TRUE)
   }
   
-  # Make sure we're dealing with a single protein file
+  # Make sure it's only a single prot 
   protein_file <- protein_files[1]
   
   # Generate descriptive output file name
@@ -590,63 +588,74 @@ align_multiple_sequences <- function(query_file,
 
 
 # Phylogenetic Tree function ----------------------------------------------
-create_phylogenetic_trees <- function(filtered_results,
-                                      pipeline_results,
-                                      output_dir,
-                                      min_sequences = 2,
-                                      include_query_seq = TRUE) {
-  
+create_phylogenetic_trees <- function(df, min_sequences = 2) {
   # Initialize list to store tree results
   tree_results <- list()
   
-  # Group sequences by query name
-  query_groups <- filtered_results %>%
-    group_by(query_name) %>%
-    summarise(
-      protein_files = list(protein_sequence_path),
-      count = n(),
-      .groups = "drop"
-    ) %>%
-    dplyr::filter(count >= min_sequences)
+  # Filter for rows that passed the filter
+  df_passed <- df |> dplyr::filter(passed_filter == TRUE)
   
-  # If no queries have enough sequences, return empty list
-  if (nrow(query_groups) == 0) {
-    message("No queries have enough sequences to build trees (minimum required: ", min_sequences, ")")
-    return(tree_results)
-  }
+  # Get distinct query names
+  distinct_queries <- df_passed |> 
+    dplyr::distinct(query_name) |> 
+    pull(query_name)
   
-  message("Building phylogenetic trees for ", nrow(query_groups), " queries")
+  message("Found ", length(distinct_queries), " distinct queries")
   
-  # For each query with enough sequences, build a tree
-  for (i in seq_len(nrow(query_groups))) {
-    query_name <- query_groups$query_name[i]
-    protein_files <- unlist(query_groups$protein_files[i])
+  # Process each query separately
+  for (query_name in distinct_queries) {
+    message("Processing query: ", query_name)
     
-    message("Creating tree for query: ", query_name)
+    # Filter dataframe for current query
+    query_df <- df_passed |> dplyr::filter(query_name == !!query_name)
     
-    # Find original query file if including query sequence
-    original_query_file <- NULL
-    if (include_query_seq) {
-      query_info <- pipeline_results %>%
-        dplyr::filter(query_name == !!query_name) %>%
-        dplyr::select(query_path) %>%
-        distinct()
+    # Extract chromosomes from seqids and get unique values
+    chromosomes <- query_df$seqid |>
+      stringi::stri_extract(regex = "chr[0-9]{2}") |>
+      unique() |>
+      na.omit()
+    
+    message("  Found ", length(chromosomes), " chromosomes for query ", query_name)
+    
+    # For each chromosome, create a separate tree
+    for (chrom in chromosomes) {
+      message("  Processing chromosome: ", chrom)
       
-      if (nrow(query_info) > 0 && !is.na(query_info$query_path[1])) {
-        original_query_file <- query_info$query_path[1]
+      # Filter for sequences from this chromosome
+      chrom_df <- query_df |>
+        dplyr::filter(stringi::stri_detect(seqid, regex = paste0("^", chrom, ".*")))
+      
+      # Check if enough sequences for this query-chromosome combination
+      if (nrow(chrom_df) < min_sequences) {
+        message("    Not enough sequences for ", query_name, " on ", chrom, 
+                " (found ", nrow(chrom_df), ", minimum required: ", min_sequences, ")")
+        next
       }
-    }
-    
-    # Call the create_query_tree function
-    tree_result <- create_query_tree(
-      query_name = query_name,
-      protein_files = protein_files,
-      output_dir = output_dir,
-      original_query_file = original_query_file
-    )
-    
-    if (!is.null(tree_result)) {
-      tree_results[[query_name]] <- tree_result
+      
+      # Get protein files for this query-chromosome combination
+      protein_files <- chrom_df$protein_sequence_path
+      
+      # Get original query file
+      original_query_file <- unique(chrom_df$query_path)[1]
+      
+      # Determine output directory from alignment file path
+      output_dir <- dirname(dirname(chrom_df$alignment_file_path[1]))
+      
+      # Create tree key for storing results
+      tree_key <- paste0(query_name, "_", chrom)
+      
+      # Call the create_query_tree function with the chromosome in the name
+      tree_result <- create_query_tree(
+        query_name = tree_key,
+        protein_files = protein_files,
+        output_dir = output_dir,
+        original_query_file = original_query_file,
+        chromosome_name = chrom
+      )
+      
+      if (!is.null(tree_result)) {
+        tree_results[[tree_key]] <- tree_result
+      }
     }
   }
   
@@ -654,10 +663,13 @@ create_phylogenetic_trees <- function(filtered_results,
   return(tree_results)
 }
 
+
+
 create_query_tree <- function(query_name,
                               protein_files,
                               output_dir,
-                              original_query_file = NULL) {
+                              original_query_file = NULL,
+                              chromosome_name = NULL) {
   # Create directory for trees
   tree_dir <- file.path(output_dir, "phylogenetic_trees")
   if (!dir.exists(tree_dir)) {
@@ -690,7 +702,7 @@ create_query_tree <- function(query_name,
         query_seq <- query_seq[1]
       }
       # Rename query sequence for clarity
-      names(query_seq) <- paste0(names(query_seq), " [QUERY]")
+      names(query_seq) <- "[QUERY]"
       all_seqs <- c(all_seqs, query_seq)
     }
     
@@ -698,14 +710,11 @@ create_query_tree <- function(query_name,
     for (protein_file in protein_files) {
       if (file.exists(protein_file)) {
         protein_seq <- readAAStringSet(protein_file)
-        # Add genome identifier from filename to make sequence names unique
-        genome_id <- sub(".*_(.*?)_protein\\.fasta$", "\\1", basename(protein_file))
-        names(protein_seq) <- paste0(names(protein_seq), " [", genome_id, "]")
         all_seqs <- c(all_seqs, protein_seq)
       }
     }
     
-    # Proceed only if we have enough sequences
+    # Proceed only if there're enough sequences
     if (length(all_seqs) < 2) {
       message("  Not enough sequences to build a tree (minimum 2 required)")
       return(NULL)
@@ -734,16 +743,19 @@ create_query_tree <- function(query_name,
     write.tree(tree, file = tree_file)
     message("  Saved phylogenetic tree to: ", basename(tree_file))
     
+    browser()
     # Create tree visualization
     message("  Creating tree visualization...")
-    plot <- ggtree(tree) + 
-      geom_tiplab() + 
-      labs(title = paste("Phylogenetic Tree for", query_name)) + 
-      theme_tree2() + 
-      xlim(0, max(node.depth.edgelength(tree)) * 1.5) # Make space for labels
+    # clean tip label name
+    tree$tip.label <- clean_tip_label(tree$tip.label)
+    
+    plot <- ggtree(tree, layout = "circular", open.angle = 340) + 
+      geom_tiplab(aes(angle = angle), color='blue') +
+      labs(title = paste0("Phylogenetic Tree for Query ", query_name)) 
+      
     
     # Save plot to file
-    ggsave(tree_plot_file, plot, width = 12, height = 8)
+    ggsave(tree_plot_file, plot, width = 14, height = 12, dpi = 300)
     message("  Saved tree visualization to: ", basename(tree_plot_file))
     
     # Return tree results
@@ -775,19 +787,18 @@ create_query_tree <- function(query_name,
 #' @param min_score_threshold Minimum alignment score threshold for filtering
 #' @param min_pid_threshold Minimum percent identity threshold for filtering
 #' @param min_tree_sequences Minimum number of sequences required for tree building
-#' @param reference_file Reference file for analysis
 #' @return Data frame with complete pipeline results
 run_problaster_pipeline <- function(genome_dir,
                                     query_dir,
                                     gff_dir,
+                                    index_path,
                                     output_dir,
                                     evalue = 1e-5,
                                     generate_alignments = TRUE,
                                     generate_trees = TRUE,
                                     min_score_threshold = 300, # Added default value
                                     min_pid_threshold = 25,    # Added default value
-                                    min_tree_sequences = 2,
-                                    reference_file) {
+                                    min_tree_sequences = 2) {
   # Initialize error logging
   setup_logging()
   
@@ -803,7 +814,8 @@ run_problaster_pipeline <- function(genome_dir,
   if (missing(genome_dir) ||
       missing(query_dir) ||
       missing(gff_dir) ||
-      missing(output_dir)) {
+      missing(output_dir) ||
+      missing(index_path)) {
     stop("Required parameter missing! Please provide all required directories.")
   }
   
@@ -814,7 +826,7 @@ run_problaster_pipeline <- function(genome_dir,
   }
   
   # Read and validate index file mapping genomes to GFF files
-  index_file_path <- "index.csv"
+  index_file_path <- index_path
   if (!file.exists(index_file_path)) {
     stop(
       "Required index file 'index.csv' does not exist. This file should map genome files to GFF files."
@@ -855,7 +867,7 @@ run_problaster_pipeline <- function(genome_dir,
   
   
   
-  ## Step 1: Run BLAST searches ----------------------------------------------
+  ## Step 1: Run BLAST searches 
   message("\n== STEP 1: Running tBLASTn searches ==")
   blast_results <- create_blastdb_and_run_tblastn(
     genome_dir = genome_dir,
@@ -866,7 +878,7 @@ run_problaster_pipeline <- function(genome_dir,
   
   
   
-  ## Step 2: Process BLAST hits to find corresponding genes ------------------
+  ## Step 2: Process BLAST hits to find corresponding genes 
   message("\n== STEP 2: Finding annotated genes corresponding to tBLASTn hits ==")
   
   # Create directory for gene hits
@@ -997,7 +1009,7 @@ run_problaster_pipeline <- function(genome_dir,
   
   
   
-  ## Step 3: Extract and translate gene sequences to proteins ----------------
+  ## Step 3: Extract and translate gene sequences to proteins 
   message("\n== STEP 3: Extracting and translating gene sequences ==")
   
   # Combine our results with the original genome mapping
@@ -1024,7 +1036,7 @@ run_problaster_pipeline <- function(genome_dir,
   )
   
   # Process each gene match file
-  message("Processing ",
+  message("\nProcessing ",
           nrow(pipeline_results),
           " gene match files for protein generation")
   
@@ -1116,7 +1128,10 @@ run_problaster_pipeline <- function(genome_dir,
   
   
   
-  ## Step 4: Filter sequences by pair alignment and gen. aln's ---------------
+  
+  
+  
+  ## Step 4: Filter sequences by pair alignment and gen. aln's 
   alignment_results <- data.frame(
     query_name = character(0),
     query_path = character(0),
@@ -1165,7 +1180,7 @@ run_problaster_pipeline <- function(genome_dir,
       # Look up the query path from blast results
       query_path <- find_query_path_by_name(query_name, blast_results)
       
-      # Skip if we can't find the query path
+      # Skip if can't find query path
       if (is.na(query_path) || !file.exists(query_path)) {
         message("Warning: Cannot find query file for ", query_name, ". Skipping this query.")
         next
@@ -1183,13 +1198,13 @@ run_problaster_pipeline <- function(genome_dir,
         stringsAsFactors = FALSE
       )
       
-      ### Each protein seq: pairwise align and score ---------------------------
+      ### Each protein seq: pairwise align and score 
       for (protein_file in protein_files) {
         message("  Scoring: ", basename(protein_file))
         
         # Get alignment score and percent identity
         alignment_result <- pairwise_align_protein_sequences_and_score(
-          query_file = query_path,  # We now have query_path from find_query_path_by_name
+          query_file = query_path,  
           protein_files = c(protein_file),
           output_dir = output_dir,
           query_name = paste0(query_name, "_", basename(protein_file))
@@ -1251,7 +1266,7 @@ run_problaster_pipeline <- function(genome_dir,
           )
         )
         
-        #### Create score vs pid scatter plot ----------------------------------------
+        ### Create score vs pid scatter plot 
         plot <- ggplot(data = scores_data, 
                        mapping = aes(x = pscore, y = pid, color = passed_filter)) +
           geom_point(size = 3) +
@@ -1294,9 +1309,9 @@ run_problaster_pipeline <- function(genome_dir,
           " filtered sequences"
         )
         
-        ## Generate multiple sequence alignment with filtered sequences --------
+        ## Generate multiple sequence alignment with filtered sequences 
         alignment_file <- align_multiple_sequences(
-          query_file = query_path,  # We already have query_path from find_query_path_by_name
+          query_file = query_path,  
           protein_files = filtered_proteins,
           output_dir = output_dir,
           query_name = paste0(query_name, "_filtered")
@@ -1308,7 +1323,7 @@ run_problaster_pipeline <- function(genome_dir,
             alignment_results,
             data.frame(
               query_name = query_name,
-              query_path = query_path,  # We have this from find_query_path_by_name
+              query_path = query_path,  
               alignment_file_path = alignment_file,
               num_sequences = length(filtered_proteins),
               stringsAsFactors = FALSE
@@ -1342,27 +1357,10 @@ run_problaster_pipeline <- function(genome_dir,
   }
   
   
-  ## Step 5: Create phylogenetic trees if requested ----------------------------
-  tree_results <- NULL
-  if (generate_trees && nrow(filtered_protein_results) > 0) {
-    message("\n== STEP 5: Creating phylogenetic trees ==")
-    
-    # Filter results to get only sequences that passed the filter
-    sequences_for_trees <- filtered_protein_results %>%
-      dplyr::filter(passed_filter == TRUE)
-    
-    # Create trees using filtered sequences
-    tree_results <- create_phylogenetic_trees(
-      filtered_results = sequences_for_trees,
-      pipeline_results = pipeline_results,
-      output_dir = output_dir,
-      min_sequences = min_tree_sequences,
-      include_query_seq = TRUE
-    )
-  }
   
-  ## Step 6: Combine pipeline results ------------------------------------------
-  message("\n== STEP 6: Combining pipeline results ==")
+  
+  ## Step 5: Combine pipeline results 
+  message("\n== STEP 5: Combining pipeline results ==")
   
   # Join the protein generation results with pipeline results
   intermediate_results <- pipeline_results %>%
@@ -1412,6 +1410,31 @@ run_problaster_pipeline <- function(genome_dir,
   final_mapping_file <- file.path(output_dir, "problaster_complete_pipeline_results.csv")
   write_csv(final_results, file = final_mapping_file)
   message("Complete pipeline results saved to: ", final_mapping_file)
+  
+  
+  
+  
+  
+  
+  
+  
+  ## Step 6: Create phylogenetic trees if requested 
+  tree_results <- NULL
+  if (generate_trees && nrow(final_results) > 0) {
+    message("\n== STEP 6: Creating phylogenetic trees ==")
+    
+    # Create trees using filtered sequences
+    tree_results <- create_phylogenetic_trees(df = final_results, 
+                                              min_sequences = min_tree_sequences)
+  }
+  
+  
+  
+  
+  
+  
+  
+  
   
   # Generate a summary report
   pipeline_summary <- data.frame(
@@ -1491,45 +1514,93 @@ find_query_path_by_name <- function(query_name, blast_results) {
   }
 }
 
-#' Filters gene hits based on position and score
-#'
-#' This function filters gene hits to identify the most significant matches
-#' by including only those above a certain bitscore.
-#'
-#' @param blast_hits DataFrame containing BLAST hits
-#' @param min_bitscore Minimum bitscore threshold for filtering
-#' @return Filtered DataFrame with the most significant hits
-filter_gene_hits <- function(blast_hits, min_bitscore = 30) {
-  if (nrow(blast_hits) == 0) {
-    return(blast_hits)
+clean_tip_label <- function(tip_labels) {
+  # Initialize output vector
+  new_labels <- character(length(tip_labels))
+  
+  for (i in 1:length(tip_labels)) {
+    tip_label <- tip_labels[i]
+    
+    # Special case for query label
+    if (tip_label == "[QUERY]") {
+      new_labels[i] <- tip_label
+      next
+    }
+    
+    # Try to extract gene ID using various patterns
+    gene_id <- NULL
+    # Pattern for standard _g12345.t1 format
+    gene_match <- regexpr("_g[0-9]+\\.t[0-9]+", tip_label)
+    if (gene_match > 0) {
+      gene_id <- substr(tip_label, gene_match + 1, 
+                        gene_match + attr(gene_match, "match.length") - 1)
+    } else {
+      # Alternative pattern for other gene ID formats
+      gene_match <- regexpr("g[0-9]+\\.t[0-9]+", tip_label)
+      if (gene_match > 0) {
+        gene_id <- substr(tip_label, gene_match, 
+                          gene_match + attr(gene_match, "match.length") - 1)
+      }
+    }
+    
+    # Try to extract chromosome info
+    chrom_info <- NULL
+    chrom_patterns <- c("chr[0-9]+_hap[0-9]+", "chr[0-9]+", "scaffold[0-9]+")
+    
+    for (pattern in chrom_patterns) {
+      chrom_match <- regexpr(pattern, tip_label)
+      if (chrom_match > 0) {
+        chrom_info <- substr(tip_label, chrom_match, 
+                             chrom_match + attr(chrom_match, "match.length") - 1)
+        break  # Exit loop after first match
+      }
+    }
+    
+    # Create new label based on what was found
+    if (!is.null(gene_id) && !is.null(chrom_info)) {
+      # Gene ID and chromosome found
+      new_labels[i] <- paste0(gene_id, " (", chrom_info, ")")
+    } else if (!is.null(gene_id)) {
+      # Gene ID found
+      new_labels[i] <- gene_id
+    } else if (!is.null(chrom_info)) {
+      # Only Chromosome info found
+      new_labels[i] <- paste0("Unknown gene (", chrom_info, ")")
+    } else {
+      # Fallback: Extract everything before "| Source:" if present
+      source_pos <- regexpr(" \\| Source:", tip_label)
+      if (source_pos > 1) {
+        new_labels[i] <- substr(tip_label, 1, source_pos - 1)
+      } else {
+        # If all else fails, keep original label
+        new_labels[i] <- tip_label
+      }
+    }
   }
   
-  # Filter by bitscore
-  filtered_hits <- blast_hits |>
-    dplyr::filter(bitscore >= min_bitscore)
-  
-  return(filtered_hits)
+  return(new_labels)
 }
+
 
 
 # Example call ------------------------------------------------------------
 # Example of how to run the complete pipeline
-if (T) {  # Set to TRUE to execute when sourcing this file
+# don't end path with "/" or "\"
   results <- run_problaster_pipeline(
     genome_dir = "genomes/test_genomes",
     query_dir = "meiotic_genes_protein_fasta/test_meiotic_prot",
     gff_dir = "gff_files",
-    output_dir = "out_2025_03_06_SPO11_test",
+    index_path = "index.csv",
+    # index of genom to gff mapping
+    output_dir = "out_2025_03_07_tree_test",
     evalue = 1e-5,
+    # tBLASTn evalue
     generate_alignments = TRUE,
     generate_trees = TRUE,
     min_score_threshold = 300,
     # Minimum acceptable BLOSUM62 score
     min_pid_threshold = 25,
     # Minimum percent identity (0-100)
-    min_tree_sequences = 2,
+    min_tree_sequences = 2
     # Minimum sequences to build a tree
-    reference_file = "A_tha/A_tha_SPO11_1.fasta"
-    # not used atm
   )
-}
