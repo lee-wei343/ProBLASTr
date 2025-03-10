@@ -743,15 +743,13 @@ create_query_tree <- function(query_name,
     write.tree(tree, file = tree_file)
     message("  Saved phylogenetic tree to: ", basename(tree_file))
     
-    browser()
     # Create tree visualization
     message("  Creating tree visualization...")
     # clean tip label name
     tree$tip.label <- clean_tip_label(tree$tip.label)
     
     plot <- ggtree(tree, layout = "circular", open.angle = 340) + 
-      geom_tiplab(aes(angle = angle), color='blue') +
-      labs(title = paste0("Phylogenetic Tree for Query ", query_name)) 
+      geom_tiplab(aes(angle = angle), color = 'blue')  
       
     
     # Save plot to file
@@ -878,7 +876,7 @@ run_problaster_pipeline <- function(genome_dir,
   
   
   
-  ## Step 2: Process BLAST hits to find corresponding genes 
+  ## Step 2: Finding annotated genes corresponding to tBLASTn hits 
   message("\n== STEP 2: Finding annotated genes corresponding to tBLASTn hits ==")
   
   # Create directory for gene hits
@@ -1563,9 +1561,6 @@ clean_tip_label <- function(tip_labels) {
     } else if (!is.null(gene_id)) {
       # Gene ID found
       new_labels[i] <- gene_id
-    } else if (!is.null(chrom_info)) {
-      # Only Chromosome info found
-      new_labels[i] <- paste0("Unknown gene (", chrom_info, ")")
     } else {
       # Fallback: Extract everything before "| Source:" if present
       source_pos <- regexpr(" \\| Source:", tip_label)
@@ -1577,7 +1572,6 @@ clean_tip_label <- function(tip_labels) {
       }
     }
   }
-  
   return(new_labels)
 }
 
@@ -1586,21 +1580,21 @@ clean_tip_label <- function(tip_labels) {
 # Example call ------------------------------------------------------------
 # Example of how to run the complete pipeline
 # don't end path with "/" or "\"
-  results <- run_problaster_pipeline(
-    genome_dir = "genomes/test_genomes",
-    query_dir = "meiotic_genes_protein_fasta/test_meiotic_prot",
-    gff_dir = "gff_files",
-    index_path = "index.csv",
-    # index of genom to gff mapping
-    output_dir = "out_2025_03_07_tree_test",
-    evalue = 1e-5,
-    # tBLASTn evalue
-    generate_alignments = TRUE,
-    generate_trees = TRUE,
-    min_score_threshold = 300,
-    # Minimum acceptable BLOSUM62 score
-    min_pid_threshold = 25,
-    # Minimum percent identity (0-100)
-    min_tree_sequences = 2
-    # Minimum sequences to build a tree
-  )
+results <- run_problaster_pipeline(
+  genome_dir = "genomes/test_genomes",
+  query_dir = "meiotic_genes_protein_fasta/test_meiotic_prot",
+  gff_dir = "gff_files",
+  index_path = "index.csv",
+  # index of genom to gff mapping
+  output_dir = "test",
+  evalue = 1e-5,
+  # tBLASTn evalue
+  generate_alignments = TRUE,
+  generate_trees = TRUE,
+  min_score_threshold = 300,
+  # Minimum acceptable BLOSUM62 score
+  min_pid_threshold = 25,
+  # Minimum percent identity (0-100)
+  min_tree_sequences = 2
+  # Minimum sequences to build a tree
+)
